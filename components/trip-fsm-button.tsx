@@ -4,17 +4,24 @@
 import { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Loader2 } from "lucide-react"
-import type { RaceState, UIFSMState, TransitionAction } from "@/lib/fsm-types"
-import { RACE_STATE_TO_BUTTON, logFSMEvent } from "@/lib/fsm-types"
+import type { RaceState, RaceContext, UIFSMState, TransitionAction } from "@/lib/fsm-types"
+import { RACE_STATE_TO_BUTTON, logFSMEvent, validateTransition } from "@/lib/fsm-types"
 
 interface TripFSMButtonProps {
   raceState: RaceState
+  context: RaceContext
   onTransition: (action: TransitionAction) => Promise<{ status: "ok" | "error"; raceState: RaceState }>
   disabled?: boolean
   className?: string
 }
 
-export function TripFSMButton({ raceState, onTransition, disabled = false, className }: TripFSMButtonProps) {
+export function TripFSMButton({ 
+  raceState, 
+  context,
+  onTransition, 
+  disabled = false, 
+  className 
+}: TripFSMButtonProps) {
   const [uiFSMState, setUIFSMState] = useState<UIFSMState>("idle")
   const buttonConfig = RACE_STATE_TO_BUTTON[raceState]
 
@@ -28,14 +35,35 @@ export function TripFSMButton({ raceState, onTransition, disabled = false, class
 
   const handleClick = async () => {
     if (!buttonConfig.enabled || disabled || buttonConfig.action === "none") {
-      logFSMEvent("ui:blocked", { reason: "button_disabled", raceState })
+      logFSMEvent("ui:blocked", { 
+        reason: "button_disabled", 
+        oldState: raceState,
+        context 
+      })
+      return
+    }
+
+    // Валидация перехода ПЕРЕД выполнением
+    const validation = validateTransition(raceState, buttonConfig.action, context)
+    
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", { 
+        oldState: raceState,
+        action: buttonConfig.action,
+        context,
+        details: { error: validation.error }
+      })
+      setUIFSMState("error")
+      setTimeout(() => setUIFSMState("idle"), 2000)
       return
     }
 
     logFSMEvent("fsm:transition_start", { 
       action: buttonConfig.action, 
-      raceState,
-      uiFSMState: "processing"
+      oldState: raceState,
+      expectedNewState: validation.nextState,
+      uiFSMState: "processing",
+      context
     })
 
     setUIFSMState("processing")
@@ -46,8 +74,10 @@ export function TripFSMButton({ raceState, onTransition, disabled = false, class
       if (response.status === "ok") {
         logFSMEvent("fsm:transition_success", { 
           action: buttonConfig.action,
-          newRaceState: response.raceState,
-          uiFSMState: "success"
+          oldState: raceState,
+          newState: response.raceState,
+          uiFSMState: "success",
+          context
         })
         setUIFSMState("success")
         
@@ -58,8 +88,9 @@ export function TripFSMButton({ raceState, onTransition, disabled = false, class
       } else {
         logFSMEvent("fsm:transition_error", { 
           action: buttonConfig.action,
-          raceState,
-          uiFSMState: "error"
+          oldState: raceState,
+          uiFSMState: "error",
+          context
         })
         setUIFSMState("error")
         
@@ -71,9 +102,10 @@ export function TripFSMButton({ raceState, onTransition, disabled = false, class
     } catch (error) {
       logFSMEvent("fsm:transition_error", { 
         action: buttonConfig.action,
-        raceState,
+        oldState: raceState,
         error: String(error),
-        uiFSMState: "error"
+        uiFSMState: "error",
+        context
       })
       setUIFSMState("error")
       

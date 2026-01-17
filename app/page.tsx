@@ -16,7 +16,13 @@ import { GeoTrackerIndicator } from "@/components/geo-tracker-indicator"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { QueueQRScanner } from "@/components/queue-qr-scanner"
 import { CashQRDialog } from "@/components/cash-qr-dialog"
-import { RACE_STATE_TO_PANELS, TRIP_STATUS_TO_RACE_STATE } from "@/lib/fsm-types"
+import {
+  TRIP_STATUS_TO_RACE_STATE,
+  logFSMEvent,
+  createRaceContext,
+  validateTransition,
+  getPanelVisibility,
+} from "@/lib/fsm-types"
 
 const STATE = {
   PREP_IDLE: "PREP_IDLE",
@@ -94,7 +100,7 @@ interface StopHistory {
 interface VotingPassenger {
   id: number
   timeLeft: number // секунды
-  passengerCount: number // ДОБАВЛЕНО: количество человек в группе
+  passengerCount?: number // ДОБАВЛЕНО: количество человек в группе
 }
 
 interface StopVoting {
@@ -270,8 +276,6 @@ export default function DriverDashboard() {
   const [areSeatsLocked, setAreSeatsLocked] = useState(true) // Seats start locked
   const [isGeoTrackerActive, setIsGeoTrackerActive] = useState(false)
   const [showStopHistory, setShowStopHistory] = useState(false)
-  const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
-  const panelVisibility = RACE_STATE_TO_PANELS[currentRaceState]
   const scanInProgressRef = useRef(false)
 
   // ADDED: isDepositAdded state and corresponding setter
@@ -502,76 +506,112 @@ export default function DriverDashboard() {
       description: language === "ru" ? "Подготовка рейса отменена" : "Trip preparation cancelled",
     })
   }
-  // Added complete implementation for clickStartBoarding
   const clickStartBoarding = () => {
     if (tripStatus !== STATE.PREP_TIMER) {
       console.error("[v0] Illegal transition: clickStartBoarding from", tripStatus)
       return
     }
-    // ИСПРАВЛЕНИЕ: Включаем геотрекер в начале посадки
+
+    // СОЗДАЕМ КОНТЕКСТ ЛОКАЛЬНО
+    const raceContext = createRaceContext({
+      currentStopIndex,
+      totalStops: stops.length,
+      freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+      occupiedSeats: manualOccupied,
+      hasActiveReservations: bookings.some((b) => b.fromStopIndex === currentStopIndex && !b.scanned),
+      queueSize: queuePassengers.length,
+      tripId,
+    })
+
+    // Валидация через FSM
+    const validation = validateTransition("RACE_WAITING_START", "start_boarding", raceContext)
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", {
+        oldState: "RACE_WAITING_START",
+        action: "start_boarding",
+        details: { error: validation.error },
+      })
+      toast({
+        title: t.error,
+        description: validation.error,
+        variant: "destructive",
+      })
+      return
+    }
+
+    logFSMEvent("transition:success", {
+      oldState: "RACE_WAITING_START",
+      newState: validation.nextState,
+      action: "start_boarding",
+    })
+
     setIsGeoTrackerActive(true)
     setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
     setTripStatus(STATE.BOARDING)
   }
 
   const clickReadyForRoute = () => {
-    if (tripStatus !== STATE.BOARDING) {
-      console.error("[v0] Illegal transition: clickReadyForRoute from", tripStatus)
-      return
-    }
-    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
-    setTripStatus(STATE.ROUTE_READY)
+  if (tripStatus !== STATE.BOARDING) {
+    console.error("[v0] Illegal transition: clickReadyForRoute from", tripStatus)
+    return
   }
+  setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+  setTripStatus(STATE.ROUTE_READY)
+}
 
   const clickStartRoute = () => {
-    if (tripStatus !== STATE.ROUTE_READY && tripStatus !== STATE.BOARDING) {
-      console.error("[v0] Illegal transition: clickStartRoute from", tripStatus)
-      return
-    }
-
-    // ИСПРАВЛЕННЫЙ подсчет:
-    // Зарезервировано = все брони на этой остановке, которые еще НЕ отсканированы (не сели)
-    const reservedCount = bookings
-      .filter((b) => b.fromStopIndex === currentStopIndex && !b.scanned)
-      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
-
-    // Посажено = те, кто успешно прошел сканирование на этой остановке
-    const boardedCount = bookings
-      .filter((b) => b.fromStopIndex === currentStopIndex && b.scanned)
-      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
-
-    setStopHistoryMap((prev) => {
-      const newMap = new Map(prev)
-      newMap.set(currentStopIndex, {
-        stopId: currentStopIndex,
-        reserved: reservedCount,
-        boarded: boardedCount,
-      })
-      return newMap
-    })
-
-    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
-    setCurrentStopIndex(currentStopIndex + 1)
-    setTripStatus(STATE.IN_ROUTE)
-  }
-
-  const clickArrivedAtStop = () => {
-  if (tripStatus !== STATE.IN_ROUTE) {
-    console.error("[v0] Illegal transition: clickArrivedAtStop from", tripStatus)
+  if (tripStatus !== STATE.ROUTE_READY && tripStatus !== STATE.BOARDING) {
+    console.error("[v0] Illegal transition: clickStartRoute from", tripStatus)
     return
   }
 
-  setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+  // СОЗДАЕМ КОНТЕКСТ ЛОКАЛЬНО
+  const raceContext = createRaceContext({
+    currentStopIndex,
+    totalStops: stops.length,
+    freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+    occupiedSeats: manualOccupied,
+    hasActiveReservations: bookings.some(b => b.fromStopIndex === currentStopIndex && !b.scanned),
+    queueSize: queuePassengers.length,
+    tripId,
+  })
 
-  // Подсчет статистики ПЕРЕД переходом
-  const stopBookings = bookings.filter((b) => b.fromStopIndex === currentStopIndex)
+  // Определяем правильное действие в зависимости от состояния
+  const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
+  const action = currentRaceState === "RACE_BOARDING" ? "depart_stop" : "continue_boarding"
+  
+  // Валидация через FSM
+  const validation = validateTransition(currentRaceState, action, raceContext)
+  
+  if (!validation.valid) {
+    logFSMEvent("transition:blocked", {
+      oldState: currentRaceState,
+      action: action,
+      details: { error: validation.error }
+    })
+    toast({
+      title: t.error,
+      description: validation.error,
+      variant: "destructive",
+    })
+    return
+  }
+  
+  logFSMEvent("transition:success", {
+    oldState: currentRaceState,
+    newState: validation.nextState,
+    action: action,
+  })
 
-  const reservedCount = stopBookings
-    .filter((b) => !b.scanned)
+  // ИСПРАВЛЕННЫЙ подсчет:
+  // Зарезервировано = все брони на этой остановке, которые еще НЕ отсканированы (не сели)
+  const reservedCount = bookings
+    .filter((b) => b.fromStopIndex === currentStopIndex && !b.scanned)
     .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
 
-  const boardedCount = stopBookings
-    .filter((b) => b.scanned)
+  // Посажено = те, кто успешно прошел сканирование на этой остановке
+  const boardedCount = bookings
+    .filter((b) => b.fromStopIndex === currentStopIndex && b.scanned)
     .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
 
   setStopHistoryMap((prev) => {
@@ -584,21 +624,125 @@ export default function DriverDashboard() {
     return newMap
   })
 
-  // Проверяем, конечная ли это остановка
-  if (currentStopIndex === stops.length - 1) {
-    // Конечная остановка - завершаем рейс
-    setTripStatus(STATE.FINISHED)
-  } else {
-    // Промежуточная остановка - переходим в BOARDING для посадки
-    setTripStatus(STATE.BOARDING)
-  }
+  setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+  setCurrentStopIndex(currentStopIndex + 1)
+  setTripStatus(STATE.IN_ROUTE)
 }
+
+  const clickArrivedAtStop = () => {
+    if (tripStatus !== STATE.IN_ROUTE) {
+      console.error("[v0] Illegal transition: clickArrivedAtStop from", tripStatus)
+      return
+    }
+
+    // СОЗДАЕМ КОНТЕКСТ ЛОКАЛЬНО
+    const raceContext = createRaceContext({
+      currentStopIndex,
+      totalStops: stops.length,
+      freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+      occupiedSeats: manualOccupied,
+      hasActiveReservations: bookings.some((b) => b.fromStopIndex === currentStopIndex && !b.scanned),
+      queueSize: queuePassengers.length,
+      tripId,
+    })
+
+    // Валидация через FSM
+    const validation = validateTransition("RACE_IN_TRANSIT", "arrive_stop", raceContext)
+
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", {
+        oldState: "RACE_IN_TRANSIT",
+        action: "arrive_stop",
+        details: { error: validation.error },
+      })
+      toast({
+        title: t.error,
+        description: validation.error,
+        variant: "destructive",
+      })
+      return
+    }
+
+    logFSMEvent("transition:success", {
+      oldState: "RACE_IN_TRANSIT",
+      newState: validation.nextState,
+      action: "arrive_stop",
+    })
+
+    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+
+    // Подсчет статистики ПЕРЕД переходом
+    const stopBookings = bookings.filter((b) => b.fromStopIndex === currentStopIndex)
+
+    const reservedCount = stopBookings
+      .filter((b) => !b.scanned)
+      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+    const boardedCount = stopBookings
+      .filter((b) => b.scanned)
+      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+    setStopHistoryMap((prev) => {
+      const newMap = new Map(prev)
+      newMap.set(currentStopIndex, {
+        stopId: currentStopIndex,
+        reserved: reservedCount,
+        boarded: boardedCount,
+      })
+      return newMap
+    })
+
+    // Проверяем, конечная ли это остановка
+    if (currentStopIndex === stops.length - 1) {
+      // Конечная остановка - завершаем рейс
+      setTripStatus(STATE.FINISHED)
+    } else {
+      // Промежуточная остановка - переходим в BOARDING для посадки
+      setTripStatus(STATE.BOARDING)
+    }
+  }
 
   const clickFinish = () => {
     if (tripStatus !== "FINISHED") {
       console.error("[v0] Illegal transition: clickFinish from", tripStatus)
       return
     }
+
+    // СОЗДАЕМ КОНТЕКСТ ЛОКАЛЬНО
+    const raceContext = createRaceContext({
+      currentStopIndex,
+      totalStops: stops.length,
+      freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+      occupiedSeats: manualOccupied,
+      hasActiveReservations: bookings.some((b) => b.fromStopIndex === currentStopIndex && !b.scanned),
+      queueSize: queuePassengers.length,
+      tripId,
+    })
+
+    // Валидация через FSM
+    const validation = validateTransition("RACE_FINISHED", "end_shift", raceContext)
+
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", {
+        oldState: "RACE_FINISHED",
+        action: "end_shift",
+        details: { error: validation.error },
+      })
+      toast({
+        title: t.error,
+        description: validation.error,
+        variant: "destructive",
+      })
+      return
+    }
+
+    logFSMEvent("transition:success", {
+      oldState: "RACE_FINISHED",
+      newState: validation.nextState,
+      action: "end_shift",
+    })
+
+    // Остальной код без изменений
     setIsGeoTrackerActive(false)
     setAreSeatsLocked(true)
     setPrepareTimer(600)
@@ -610,13 +754,13 @@ export default function DriverDashboard() {
     setStopHistoryMap(new Map())
     setStopVoting({
       1: [
-        { id: 1, timeLeft: 60 },
-        { id: 2, timeLeft: 60 },
+        { id: 1, timeLeft: 60, passengerCount: 2 },
+        { id: 2, timeLeft: 60, passengerCount: 3 },
       ],
-      2: [{ id: 1, timeLeft: 60 }],
+      2: [{ id: 1, timeLeft: 60, passengerCount: 1 }],
     })
     setManualOccupied(0)
-    setIsDepositAdded(false) // ADDED: Reset isDepositAdded
+    setIsDepositAdded(false)
 
     // Сбросить статусы броней к начальному состоянию
     setBookings([
@@ -695,9 +839,8 @@ export default function DriverDashboard() {
       { id: 4, name: "Ольга К.", queuePosition: 4, isFirst: false, count: 3, ticketCount: 3, orderNumber: 4 },
       { id: 5, name: "Сергей Д.", queuePosition: 5, isFirst: false, count: 1, ticketCount: 1, orderNumber: 5 },
     ])
-
-    // НЕ ОЧИЩАЕМ localStorage здесь - он автоматически обновится через useEffect
   }
+
   const getTripButtonText = () => {
   if (tripStatus === STATE.PREP_IDLE) return t.prepareTrip
 
@@ -717,7 +860,7 @@ export default function DriverDashboard() {
     if (currentStopIndex === 0) {
       return language === "ru" ? "Отправиться" : "Depart"
     } else {
-      return language === "ru" ? "Продолжить рейс" : "Continue Trip"
+      return language === "ru" ? "Продолжить рейс" : "Continue Trip"  // ← ЭТОТ ТЕКСТ
     }
   }
 
@@ -759,7 +902,7 @@ export default function DriverDashboard() {
       clickStartRoute()
     } else {
       // Промежуточная остановка - завершение посадки
-      clickReadyForRoute()
+      clickReadyForRoute()  // ← ЭТА СТРОКА ДОЛЖНА БЫТЬ ЗДЕСЬ
     }
   } else if (tripStatus === STATE.ROUTE_READY) {
     clickStartRoute()
@@ -1565,6 +1708,18 @@ export default function DriverDashboard() {
   const acceptedBookingsCount = bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0)
   const freeCount = 6 - occupiedCount - acceptedBookingsCount
   const pendingBookingsCount = bookings.filter((b) => !b.accepted).reduce((sum, b) => sum + (b.count || 1), 0)
+  // Вычисляем панели для UI (используется только для отображения)
+  const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
+  const panelVisibility = getPanelVisibility(currentRaceState, {
+    currentStopIndex,
+    totalStops: stops.length,
+    freeSeats: freeCount,
+    occupiedSeats: occupiedCount,
+    hasActiveReservations: bookings.some((b) => b.fromStopIndex === currentStopIndex && !b.scanned),
+    queueSize: queuePassengers.length,
+    tripId,
+    isLastStop: currentStopIndex >= stops.length - 1,
+  })
 
   const getRouteDisplayName = () => {
     if (!selectedTrip) return t.selectTrip
@@ -1583,19 +1738,13 @@ export default function DriverDashboard() {
   }
 
   const isPanelsDisabled = (() => {
-    // Пользователь не подтвержден - всегда блокируем
     if (userStatus !== "confirmed") return true
 
-    // Проверяем состояние гонки
-    const raceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
-    const panelVisibility = RACE_STATE_TO_PANELS[raceState]
-
-    // Если панели должны быть видны по FSM, проверяем areSeatsLocked
-    if (panelVisibility.reservation || panelVisibility.queue) {
+    // Проверяем режимы панелей (не boolean!)
+    if (panelVisibility.queue !== "hidden" || panelVisibility.reservation !== "hidden") {
       return areSeatsLocked
     }
 
-    // В остальных случаях блокируем
     return true
   })()
 
@@ -1899,55 +2048,53 @@ export default function DriverDashboard() {
       </div>
 
       <div className="px-2 pt-4 space-y-6">
-        {selectedTrip &&
-  panelVisibility.cash && ( // ОСТАВИЛ КАК БЫЛО - boolean!
-    <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
-      <h2 className="text-lg font-bold text-foreground mb-4">{t.seats}</h2>
-              <div className="grid grid-cols-4 gap-3">
-                <div className="text-center p-4 rounded-lg bg-secondary">
-                  <div className="flex items-center justify-center gap-1 mb-2">
-                    <Button
-                      size="icon"
-                      variant="outline"
-                      className="h-6 w-6 bg-transparent flex-shrink-0"
-                      onClick={() => setManualOccupied(Math.max(0, manualOccupied - 1))}
-                      disabled={manualOccupied === 0 || isPanelsDisabled}
-                    >
-                      <Minus className="h-3 w-3" />
-                    </Button>
-                    <div className="text-2xl font-bold text-primary min-w-[2rem]">{occupiedCount}</div>
-                    <Button
-                      size="icon"
-                      variant="outline"
-                      className="h-6 w-6 bg-transparent flex-shrink-0"
-                      onClick={() => setManualOccupied(Math.min(6, manualOccupied + 1))}
-                      disabled={manualOccupied === 6 || isPanelsDisabled}
-                    >
-                      <Plus className="h-3 w-3" />
-                    </Button>
-                  </div>
-                  <div className="text-xs text-muted-foreground">{t.occupied}</div>
+        {selectedTrip && panelVisibility.cash !== "hidden" && (
+          <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
+            <h2 className="text-lg font-bold text-foreground mb-4">{t.seats}</h2>
+            <div className="grid grid-cols-4 gap-3">
+              <div className="text-center p-4 rounded-lg bg-secondary">
+                <div className="flex items-center justify-center gap-1 mb-2">
+                  <Button
+                    size="icon"
+                    variant="outline"
+                    className="h-6 w-6 bg-transparent flex-shrink-0"
+                    onClick={() => setManualOccupied(Math.max(0, manualOccupied - 1))}
+                    disabled={manualOccupied === 0 || isPanelsDisabled}
+                  >
+                    <Minus className="h-3 w-3" />
+                  </Button>
+                  <div className="text-2xl font-bold text-primary min-w-[2rem]">{occupiedCount}</div>
+                  <Button
+                    size="icon"
+                    variant="outline"
+                    className="h-6 w-6 bg-transparent flex-shrink-0"
+                    onClick={() => setManualOccupied(Math.min(6, manualOccupied + 1))}
+                    disabled={manualOccupied === 6 || isPanelsDisabled}
+                  >
+                    <Plus className="h-3 w-3" />
+                  </Button>
                 </div>
-                <div className="text-center p-4 rounded-lg bg-secondary">
-                  <div className="text-2xl font-bold text-blue-600">
-                    {acceptedBookingsCount}:{pendingBookingsCount}
-                  </div>
-                  <div className="text-xs text-muted-foreground mt-1">{t.bookingsShort}</div>
-                </div>
-                <div className="text-center p-4 rounded-lg bg-secondary">
-                  <div className="text-2xl font-bold text-accent">{freeCount}</div>
-                  <div className="text-xs text-muted-foreground mt-1">{t.free}</div>
-                </div>
-                <div className="text-center p-4 rounded-lg bg-secondary">
-                  <div className="text-2xl font-bold text-foreground">6</div>
-                  <div className="text-xs text-muted-foreground mt-1">{t.total}</div>
-                </div>
+                <div className="text-xs text-muted-foreground">{t.occupied}</div>
               </div>
-            </Card>
-          )}
+              <div className="text-center p-4 rounded-lg bg-secondary">
+                <div className="text-2xl font-bold text-blue-600">
+                  {acceptedBookingsCount}:{pendingBookingsCount}
+                </div>
+                <div className="text-xs text-muted-foreground mt-1">{t.bookingsShort}</div>
+              </div>
+              <div className="text-center p-4 rounded-lg bg-secondary">
+                <div className="text-2xl font-bold text-accent">{freeCount}</div>
+                <div className="text-xs text-muted-foreground mt-1">{t.free}</div>
+              </div>
+              <div className="text-center p-4 rounded-lg bg-secondary">
+                <div className="text-2xl font-bold text-foreground">6</div>
+                <div className="text-xs text-muted-foreground mt-1">{t.total}</div>
+              </div>
+            </div>
+          </Card>
+        )}
 
-        {/* CHANGE: Fixed conditional check and removed backslashes */}
-        {panelVisibility.queue && selectedTrip && 6 - manualOccupied - acceptedBookingsCount > 0 && (
+        {panelVisibility.queue !== "hidden" && selectedTrip && 6 - manualOccupied - acceptedBookingsCount > 0 && (
           <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
@@ -2033,7 +2180,7 @@ export default function DriverDashboard() {
           </Card>
         )}
 
-        {panelVisibility.reservation && selectedTrip && (
+        {panelVisibility.reservation !== "hidden" && selectedTrip && (
           <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-bold text-foreground">{t.stops}</h2>
@@ -2127,7 +2274,6 @@ export default function DriverDashboard() {
 
                           {/* Карточки бронирований показываем только на АКТУАЛЬНОЙ остановке */}
                           {visibleBookings.length > 0 && !isPastStop && (
-                            // ... остальной код карточек без изменений
                             <div className="space-y-2 mt-3">
                               {visibleBookings.map((booking) => (
                                 <div
