@@ -557,6 +557,7 @@ export default function DriverDashboard() {
     return
   }
   setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+  setAreSeatsLocked(true) // ДОБАВЛЕНО: блокируем панели
   setTripStatus(STATE.ROUTE_READY)
 }
 
@@ -632,9 +633,10 @@ export default function DriverDashboard() {
     setCurrentStopIndex(stops.length - 1)
     setTripStatus(STATE.FINISHED)
   } else {
-    setCurrentStopIndex(currentStopIndex + 1)
-    setTripStatus(STATE.IN_ROUTE)
-  }
+  setCurrentStopIndex(currentStopIndex + 1)
+  setAreSeatsLocked(true) // ДОБАВЛЕНО: блокируем панели во время движения
+  setTripStatus(STATE.IN_ROUTE)
+}
 }
 
   const clickArrivedAtStop = () => {
@@ -705,9 +707,10 @@ export default function DriverDashboard() {
       // Конечная остановка - завершаем рейс
       setTripStatus(STATE.FINISHED)
     } else {
-      // Промежуточная остановка - переходим в BOARDING для посадки
-      setTripStatus(STATE.BOARDING)
-    }
+  // Промежуточная остановка - переходим в BOARDING для посадки
+  setAreSeatsLocked(false) // ДОБАВЛЕНО: разблокируем панели для посадки
+  setTripStatus(STATE.BOARDING)
+}
   }
 
   const clickFinish = () => {
@@ -2041,8 +2044,8 @@ if (tripStatus === STATE.IN_ROUTE) {
       </div>
 
       <div className="px-2 pt-4 space-y-6">
-        {selectedTrip && panelVisibility.cash !== "hidden" && (
-          <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
+        {selectedTrip && panelVisibility.cash !== "hidden" && !isPanelsDisabled && (
+  <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
             <h2 className="text-lg font-bold text-foreground mb-4">{t.seats}</h2>
             <div className="grid grid-cols-4 gap-3">
               <div className="text-center p-4 rounded-lg bg-secondary">
@@ -2087,8 +2090,8 @@ if (tripStatus === STATE.IN_ROUTE) {
           </Card>
         )}
 
-        {panelVisibility.queue !== "hidden" && selectedTrip && 6 - manualOccupied - acceptedBookingsCount > 0 && (
-          <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
+        {panelVisibility.queue !== "hidden" && selectedTrip && 6 - manualOccupied - acceptedBookingsCount > 0 && !isPanelsDisabled && (
+  <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
                 <Users className="h-5 w-5 text-primary" />
@@ -2173,7 +2176,7 @@ if (tripStatus === STATE.IN_ROUTE) {
           </Card>
         )}
 
-        {selectedTrip && bookings.length > 0 && (tripStatus === STATE.BOARDING || tripStatus === STATE.ROUTE_READY || tripStatus === STATE.FINISHED) && (
+        {selectedTrip && bookings.length > 0 && tripStatus === STATE.BOARDING && currentStopIndex < stops.length - 1 && (
           <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-bold text-foreground">{t.stops}</h2>
