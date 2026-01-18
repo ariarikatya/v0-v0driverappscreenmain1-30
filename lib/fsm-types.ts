@@ -43,7 +43,7 @@ export interface Transition {
   from: RaceState;
   to: RaceState;
   action: TransitionAction;
-  guard?: (context: RaceContext) => boolean; // условие для перехода
+  guard?: (context: RaceContext) => boolean;
 }
 
 // Граф переходов FSM
@@ -72,13 +72,13 @@ export const FSM_TRANSITIONS: Transition[] = [
     from: "RACE_ARRIVED_STOP",
     to: "RACE_BOARDING",
     action: "continue_boarding",
-    guard: (ctx) => !ctx.isLastStop, // только если не последняя остановка
+    guard: (ctx) => !ctx.isLastStop,
   },
   {
     from: "RACE_ARRIVED_STOP",
     to: "RACE_FINISHED",
     action: "finish_trip",
-    guard: (ctx) => ctx.isLastStop, // только на последней остановке
+    guard: (ctx) => ctx.isLastStop,
   },
   {
     from: "RACE_FINISHED",
@@ -101,7 +101,6 @@ export function canTransition(
     return false;
   }
 
-  // Проверяем guard если есть
   if (transition.guard && !transition.guard(context)) {
     return false;
   }
@@ -166,8 +165,70 @@ export interface ButtonConfig {
 }
 
 // ============================================================================
-// МАППИНГ: RaceState → ButtonConfig
+// МАППИНГ: RaceState → ButtonConfig (МНОГОЯЗЫЧНЫЙ)
 // ============================================================================
+export function getButtonConfig(
+  state: RaceState,
+  language: "ru" | "en" | "fr" | "ar" | string = "ru"
+): ButtonConfig {
+  const labels = {
+    ru: {
+      RACE_OFFLINE: "Выйти на линию",
+      RACE_WAITING_START: "Начать посадку",
+      RACE_BOARDING: "Отправиться",
+      RACE_IN_TRANSIT: "Прибыл",
+      RACE_ARRIVED_STOP: "Продолжить посадку",
+      RACE_FINISHED: "Завершить рейс",
+    },
+    en: {
+      RACE_OFFLINE: "Start Shift",
+      RACE_WAITING_START: "Start Boarding",
+      RACE_BOARDING: "Depart",
+      RACE_IN_TRANSIT: "Arrived",
+      RACE_ARRIVED_STOP: "Continue Boarding",
+      RACE_FINISHED: "End Shift",
+    },
+  };
+
+  const langLabels = labels[language as keyof typeof labels] || labels.ru;
+
+  const configs: Record<RaceState, ButtonConfig> = {
+    RACE_OFFLINE: {
+      label: langLabels.RACE_OFFLINE,
+      action: "start_shift",
+      enabled: true,
+    },
+    RACE_WAITING_START: {
+      label: langLabels.RACE_WAITING_START,
+      action: "start_boarding",
+      enabled: true,
+    },
+    RACE_BOARDING: {
+      label: langLabels.RACE_BOARDING,
+      action: "depart_stop",
+      enabled: true,
+    },
+    RACE_IN_TRANSIT: {
+      label: langLabels.RACE_IN_TRANSIT,
+      action: "arrive_stop",
+      enabled: true,
+    },
+    RACE_ARRIVED_STOP: {
+      label: langLabels.RACE_ARRIVED_STOP,
+      action: "continue_boarding",
+      enabled: true,
+    },
+    RACE_FINISHED: {
+      label: langLabels.RACE_FINISHED,
+      action: "end_shift",
+      enabled: true,
+    },
+  };
+
+  return configs[state];
+}
+
+// Старый маппинг для обратной совместимости (deprecated)
 export const RACE_STATE_TO_BUTTON: Record<RaceState, ButtonConfig> = {
   RACE_OFFLINE: {
     label: "Выйти на линию",
@@ -226,12 +287,12 @@ export function getPanelVisibility(
       };
 
     case "RACE_BOARDING":
-      return {
-        mainButton: true,
-        queue: context.queueSize > 0 ? "active" : "hidden",
-        reservation: context.hasActiveReservations ? "waiting" : "hidden",
-        cash: "active",
-      };
+  return {
+    mainButton: true,
+    queue: context.queueSize > 0 ? "active" : "hidden",
+    reservation: context.hasActiveReservations || context.currentStopIndex === 0 ? "waiting" : "hidden",
+    cash: "active",
+  };
 
     case "RACE_IN_TRANSIT":
       return {
