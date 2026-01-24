@@ -1,311 +1,2680 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
+import { User, Wallet, LogOut, ArrowLeftRight, Users, Clock, Minus, Plus, QrCode, Undo2, X } from "lucide-react"
 import { LoginForm } from "@/components/login-form"
 import { RegisterForm } from "@/components/register-form"
-import { TripFSMButton } from "@/components/trip-fsm-button"
-import { QueueQRScanner, type QueuePassenger } from "@/components/queue-qr-scanner"
-import { GeoTrackerIndicator } from "@/components/geo-tracker-indicator"
-import { Button } from "@/components/ui/button"
-import { Card } from "@/components/ui/card"
-import { 
-  Wallet, 
-  LogOut, 
-  Languages, 
-  MapPin, 
-  Users, 
-  Clock,
-  ChevronRight
-} from "lucide-react"
-import Link from "next/link"
 import { translations, type Language } from "@/lib/translations"
-import { formatCurrency } from "@/lib/utils"
 import { useToast } from "@/hooks/use-toast"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import Link from "next/link"
+import { formatCurrency, formatDateTime, generateTripId } from "@/lib/utils"
+import { GeoTrackerIndicator } from "@/components/geo-tracker-indicator"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { QueueQRScanner } from "@/components/queue-qr-scanner"
+import type { QueuePassenger } from "@/components/queue-qr-scanner"
+import { CashQRDialog } from "@/components/cash-qr-dialog"
+import {
+  TRIP_STATUS_TO_RACE_STATE,
+  logFSMEvent,
+  createRaceContext,
+  validateTransition,
+  getPanelVisibility,
+  getButtonConfig,
+  QueuePassengerState,
+  PaymentState,
+  PaymentContext,
+  PaymentAction,
+  PreRaceState,
+  PreRaceContext,
+  PreRaceAction,
+  PRE_RACE_FSM_TRANSITIONS,
+} from "@/lib/fsm-types"
 
-type AuthState = "login" | "register" | "awaiting" | "dashboard"
-type TripState = "idle" | "preparation" | "boarding" | "in_transit" | "completed"
+const STATE = {
+  PREP_IDLE: "PREP_IDLE",
+  PREP_TIMER: "PREP_TIMER",
+  BOARDING: "BOARDING",
+  ROUTE_READY: "ROUTE_READY",
+  IN_ROUTE: "IN_ROUTE",
+  FINISHED: "FINISHED",
+} as const
 
-export default function HomePage() {
-  const [authState, setAuthState] = useState<AuthState>("login")
+type TripStatus = (typeof STATE)[keyof typeof STATE]
+
+interface Seat {
+  id: number
+  status: "free" | "occupied"
+  passengerName?: string
+  fromStop?: number
+  toStop?: number
+  paymentMethod?: "cash" | "qr"
+  amountPaid?: number
+}
+
+interface Booking {
+  id: number
+  passengerName: string
+  pickupTime: string
+  pickupLocation: string
+  fromStopIndex: number
+  toStopIndex: number
+  amount: number
+  accepted?: boolean
+  reserved?: boolean
+  scanned?: boolean
+  qrError?: string
+  count: number
+  showQRButtons?: boolean
+  qrData?: {
+    sum: number
+    recipient: string
+    created_at: string
+  }
+  passengerCount?: number
+  cancelContext?: "boarding" | "future_stop"
+}
+
+interface RouteStop {
+  id: number
+  name: string
+  time: string
+}
+
+interface StopHistory {
+  stopId: number
+  reserved: number
+  boarded: number
+}
+
+interface VotingPassenger {
+  id: number
+  timeLeft: number
+  passengerCount?: number
+}
+
+interface StopVoting {
+  [stopId: number]: VotingPassenger[]
+}
+
+interface RouteData {
+  start: string
+  end: string
+  tariff: number
+  stops: RouteStop[]
+}
+
+const tripRoutes: Record<string, RouteData> = {
+  "247": {
+    start: "Центр",
+    end: "Вокзал",
+    tariff: 350,
+    stops: [
+      { id: 0, name: "Центр", time: "14:00" },
+      { id: 1, name: "пл. Ленина", time: "14:15" },
+      { id: 2, name: "ТЦ Галерея", time: "14:45" },
+      { id: 3, name: "Вокзал", time: "15:15" },
+    ],
+  },
+  "248": {
+    start: "Аэропорт",
+    end: "Университет",
+    tariff: 420,
+    stops: [
+      { id: 0, name: "Аэропорт", time: "10:00" },
+      { id: 1, name: "пл. Революции", time: "10:20" },
+      { id: 2, name: "пр. Победы", time: "10:40" },
+      { id: 3, name: "Университет", time: "11:00" },
+    ],
+  },
+  "249": {
+    start: "Рынок",
+    end: "Больница",
+    tariff: 300,
+    stops: [
+      { id: 0, name: "Рынок", time: "08:00" },
+      { id: 1, name: "ул. Мира", time: "08:20" },
+      { id: 2, name: "Парк", time: "08:40" },
+      { id: 3, name: "Больница", time: "09:00" },
+    ],
+  },
+}
+
+export default function DriverDashboard() {
+  console.log("[v0] DriverDashboard initializing")
+
+  // ============================================================================
+  // FSM ПРЕДРЕЙСОВОГО ЭКРАНА
+  // ============================================================================
+  const [preRaceState, setPreRaceState] = useState<PreRaceState | null>("route_selection")
+  
+  // ============================================================================
+  // ОСНОВНЫЕ СОСТОЯНИЯ
+  // ============================================================================
+  const [currentStopIndex, setCurrentStopIndex] = useState<number>(0)
+  const [visitedStops, setVisitedStops] = useState(new Set() as Set<number>)
+
+  const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [showRegister, setShowRegister] = useState(false)
+  const [userStatus, setUserStatus] = useState<"pending" | "approved" | "confirmed">("pending")
   const [language, setLanguage] = useState<Language>("ru")
-  const [tripState, setTripState] = useState<TripState>("idle")
-  const [balance, setBalance] = useState(12450)
-  const { toast } = useToast()
   const t = translations[language]
+  const { toast } = useToast()
 
-  // Queue passengers state
-  const [passengers, setPassengers] = useState<QueuePassenger[]>([
-    { id: 1, name: "Иван П.", queuePosition: 1, isFirst: true, count: 2, ticketCount: 2, orderNumber: 101 },
-    { id: 2, name: "Ольга В.", queuePosition: 2, isFirst: false, count: 1, ticketCount: 1, orderNumber: 102 },
-    { id: 3, name: "Сергей К.", queuePosition: 3, isFirst: false, count: 3, ticketCount: 3, orderNumber: 103 },
-    { id: 4, name: "Мария С.", queuePosition: 4, isFirst: false, count: 1, ticketCount: 1, orderNumber: 104 },
-    { id: 5, name: "Алексей Д.", queuePosition: 5, isFirst: false, count: 2, ticketCount: 2, orderNumber: 105 },
+  const [activeTab, setActiveTab] = useState<string>("dashboard")
+  const [deposit, setDeposit] = useState<number>(0)
+  const [commission, setCommission] = useState<number>(0)
+
+  const [tripStatus, setTripStatus] = useState<TripStatus>(STATE.PREP_IDLE)
+  const [tripId, setTripId] = useState<string>("")
+  const [selectedTrip, setSelectedTrip] = useState("")
+  const [isDirectionReversed, setIsDirectionReversed] = useState(false)
+  const [isRouteDropdownDisabled, setIsRouteDropdownDisabled] = useState(false)
+
+  const [prepareTimer, setPrepareTimer] = useState<number>(600)
+
+  const [balance, setBalance] = useState(12450)
+  const [showCashQRDialog, setShowCashQRDialog] = useState(false)
+  const [currentCashAmount, setCurrentCashAmount] = useState(0)
+  const [qrScannedData, setQrScannedData] = useState<{
+    amount: number
+    recipient: string
+    createdAt: string
+    scannedPassengerId?: number
+  } | null>(null)
+  const [stopHistoryMap, setStopHistoryMap] = useState(new Map() as Map<number, StopHistory>)
+
+  const [stops, setStops] = useState<RouteStop[]>([])
+
+  const [seats, setSeats] = useState<Seat[]>([
+    {
+      id: 1,
+      status: "occupied",
+      passengerName: "Иван П.",
+      fromStop: 0,
+      toStop: 3,
+      paymentMethod: "qr",
+      amountPaid: 450,
+    },
+    {
+      id: 2,
+      status: "occupied",
+      passengerName: "Мария С.",
+      fromStop: 0,
+      toStop: 2,
+      paymentMethod: "cash",
+      amountPaid: 280,
+    },
+    { id: 3, status: "free" },
+    { id: 4, status: "free" },
+    {
+      id: 5,
+      status: "occupied",
+      passengerName: "Алексей К.",
+      fromStop: 0,
+      toStop: 3,
+      paymentMethod: "qr",
+      amountPaid: 380,
+    },
+    { id: 6, status: "free" },
   ])
 
-  // Load auth state from localStorage
-  useEffect(() => {
-    const savedAuth = localStorage.getItem("driverAuthState")
-    if (savedAuth === "dashboard") {
-      setAuthState("dashboard")
+  const [bookings, setBookings] = useState<Booking[]>([
+    {
+      id: 1,
+      passengerName: "Ольга В.",
+      pickupTime: "14:15",
+      pickupLocation: tripRoutes["247"].stops[1].name,
+      fromStopIndex: 1,
+      toStopIndex: 3,
+      amount: 320,
+      count: 1,
+      passengerCount: 1,
+    },
+    {
+      id: 2,
+      passengerName: "Дмитрий Н.",
+      pickupTime: "14:15",
+      pickupLocation: tripRoutes["247"].stops[1].name,
+      fromStopIndex: 1,
+      toStopIndex: 3,
+      amount: 320,
+      count: 2,
+      passengerCount: 1,
+    },
+    {
+      id: 3,
+      passengerName: "Елена Т.",
+      pickupTime: "14:45",
+      pickupLocation: tripRoutes["247"].stops[2].name,
+      fromStopIndex: 2,
+      toStopIndex: 3,
+      amount: 180,
+      count: 1,
+      passengerCount: 1,
+    },
+  ])
+
+  // ============================================================================
+  // FSM ОЧЕРЕДИ - С НОВЫМИ СОСТОЯНИЯМИ
+  // ============================================================================
+  const [queuePassengers, setQueuePassengers] = useState<QueuePassenger[]>([
+    { 
+      id: 1, 
+      name: "Петр С.", 
+      queuePosition: 1, 
+      isFirst: true, 
+      count: 1, 
+      ticketCount: 1, 
+      orderNumber: 1,
+      fsmState: "waiting"
+    },
+    { 
+      id: 2, 
+      name: "Анна М.", 
+      queuePosition: 2, 
+      isFirst: false, 
+      count: 2, 
+      ticketCount: 2, 
+      orderNumber: 2,
+      fsmState: "waiting"
+    },
+    { 
+      id: 3, 
+      name: "Игорь Л.", 
+      queuePosition: 3, 
+      isFirst: false, 
+      count: 1, 
+      ticketCount: 1, 
+      orderNumber: 3,
+      fsmState: "waiting"
+    },
+    { 
+      id: 4, 
+      name: "Ольга К.", 
+      queuePosition: 4, 
+      isFirst: false, 
+      count: 3, 
+      ticketCount: 3, 
+      orderNumber: 4,
+      fsmState: "waiting"
+    },
+    { 
+      id: 5, 
+      name: "Сергей Д.", 
+      queuePosition: 5, 
+      isFirst: false, 
+      count: 1, 
+      ticketCount: 1, 
+      orderNumber: 5,
+      fsmState: "waiting"
+    },
+  ])
+
+  // ============================================================================
+  // FSM ОПЛАТЫ - НОВОЕ СОСТОЯНИЕ
+  // ============================================================================
+  const [paymentFSM, setPaymentFSM] = useState<{
+    state: PaymentState
+    context: PaymentContext
+  }>({
+    state: "idle",
+    context: {
+      paymentType: "cash",
+      amount: 0,
     }
-    
-    const savedLang = localStorage.getItem("driverLanguage")
-    if (savedLang) {
-      setLanguage(savedLang as Language)
+  })
+
+  const [manualOccupied, setManualOccupied] = useState(0)
+  const [tempBookingId, setTempBookingId] = useState<number | null>(null)
+  const [scanningForQueue, setScanningForQueue] = useState(false)
+  const [highlightedBookingId, setHighlightedBookingId] = useState<number | null>(null)
+  const [currentQueueScanId, setCurrentQueueScanId] = useState<number | null>(null)
+  const [highlightedPassengerId, setHighlightedPassengerId] = useState<number | null>(null)
+  const [showCancelDialog, setShowCancelDialog] = useState(false)
+  const [cancelBookingId, setCancelBookingId] = useState<number | null>(null)
+  const [cancelReason, setCancelReason] = useState<string>("")
+  const [isScanningLocked, setIsScanningLocked] = useState(false)
+  const [areSeatsLocked, setAreSeatsLocked] = useState(true)
+  const [isGeoTrackerActive, setIsGeoTrackerActive] = useState(false)
+  const [showStopHistory, setShowStopHistory] = useState(false)
+  const scanInProgressRef = useRef(false)
+
+  const [isDepositAdded, setIsDepositAdded] = useState(false)
+  const [isStateLoaded, setIsStateLoaded] = useState(false)
+  
+  const [stopVoting, setStopVoting] = useState<StopVoting>({
+    1: [
+      { id: 1, timeLeft: 60, passengerCount: 2 },
+      { id: 2, timeLeft: 60, passengerCount: 3 },
+    ],
+    2: [{ id: 1, timeLeft: 60, passengerCount: 1 }],
+  })
+
+  // ============================================================================
+  // ЭФФЕКТЫ
+  // ============================================================================
+  
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setStopVoting((prev) => {
+        const updated = { ...prev }
+        Object.keys(updated).forEach((stopId) => {
+          updated[Number(stopId)] = updated[Number(stopId)]
+            .map((voter) => ({ ...voter, timeLeft: voter.timeLeft - 1 }))
+            .filter((voter) => voter.timeLeft > 0)
+          if (updated[Number(stopId)].length === 0) {
+            delete updated[Number(stopId)]
+          }
+        })
+        return updated
+      })
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [])
+  useEffect(() => {
+    // Auth load
+    const savedAuthState = localStorage.getItem("driverAuthenticated")
+    if (savedAuthState === "true") {
+      setIsAuthenticated(true)
+    }
+    const savedUserStatus = localStorage.getItem("userStatus")
+    if (savedUserStatus) {
+      setUserStatus(savedUserStatus as "pending" | "approved" | "confirmed")
     }
 
-    const savedTripState = localStorage.getItem("driverTripState")
-    if (savedTripState) {
-      setTripState(savedTripState as TripState)
+    // App State Load
+    const savedAppState = localStorage.getItem("driverAppState")
+    if (savedAppState) {
+      try {
+        const parsedState = JSON.parse(savedAppState)
+
+        if (parsedState.tripStatus) setTripStatus(parsedState.tripStatus)
+        if (parsedState.tripId) setTripId(parsedState.tripId)
+        if (parsedState.selectedTrip) setSelectedTrip(parsedState.selectedTrip)
+        if (parsedState.hasOwnProperty("isDirectionReversed")) setIsDirectionReversed(parsedState.isDirectionReversed)
+        if (parsedState.hasOwnProperty("currentStopIndex")) setCurrentStopIndex(parsedState.currentStopIndex)
+        if (parsedState.hasOwnProperty("manualOccupied")) setManualOccupied(parsedState.manualOccupied)
+        if (parsedState.hasOwnProperty("areSeatsLocked")) setAreSeatsLocked(parsedState.areSeatsLocked)
+        if (parsedState.hasOwnProperty("isGeoTrackerActive")) setIsGeoTrackerActive(parsedState.isGeoTrackerActive)
+        if (parsedState.hasOwnProperty("prepareTimer")) setPrepareTimer(parsedState.prepareTimer)
+        if (parsedState.hasOwnProperty("deposit")) setDeposit(parsedState.deposit)
+        if (parsedState.hasOwnProperty("commission")) setCommission(parsedState.commission)
+        if (parsedState.hasOwnProperty("isDepositAdded")) setIsDepositAdded(parsedState.isDepositAdded)
+        if (parsedState.activeTab) setActiveTab(parsedState.activeTab)
+        
+        // FSM состояния
+        if (parsedState.preRaceState) setPreRaceState(parsedState.preRaceState)
+        if (parsedState.paymentFSM) setPaymentFSM(parsedState.paymentFSM)
+
+        if (parsedState.visitedStops) setVisitedStops(new Set(parsedState.visitedStops))
+        if (parsedState.bookings) setBookings(parsedState.bookings)
+        if (parsedState.seats) setSeats(parsedState.seats)
+        if (parsedState.queuePassengers) setQueuePassengers(parsedState.queuePassengers)
+        if (parsedState.stopVoting) setStopVoting(parsedState.stopVoting)
+
+        if (parsedState.stopHistoryMap) {
+          const stopHistoryMap = new Map<number, StopHistory>()
+          for (const key in parsedState.stopHistoryMap) {
+            stopHistoryMap.set(Number(key), parsedState.stopHistoryMap[key])
+          }
+          setStopHistoryMap(stopHistoryMap)
+        }
+
+        const selectedRouteData = tripRoutes[parsedState.selectedTrip as keyof typeof tripRoutes]
+        if (selectedRouteData) {
+          setStops(parsedState.isDirectionReversed ? [...selectedRouteData.stops].reverse() : selectedRouteData.stops)
+        }
+
+        console.log("[v0] State loaded successfully from localStorage")
+      } catch (error) {
+        console.error("Failed to load state, using defaults:", error)
+      }
     }
+
+    setIsStateLoaded(true)
   }, [])
 
-  // Save state to localStorage
   useEffect(() => {
-    localStorage.setItem("driverAuthState", authState)
-  }, [authState])
+    if (!isStateLoaded) {
+      return
+    }
+
+    if (
+      tripStatus === STATE.PREP_IDLE &&
+      !tripId &&
+      prepareTimer === 600 &&
+      selectedTrip === "" &&
+      !isDirectionReversed
+    ) {
+      return
+    }
+
+    const stopHistoryObject: Record<number, StopHistory> = {}
+    stopHistoryMap.forEach((value, key) => {
+      stopHistoryObject[key] = value
+    })
+
+    const stateToSave = {
+      tripStatus,
+      tripId,
+      selectedTrip,
+      isDirectionReversed,
+      currentStopIndex,
+      manualOccupied,
+      areSeatsLocked,
+      isGeoTrackerActive,
+      prepareTimer,
+      visitedStops: Array.from(visitedStops),
+      stopHistoryMap: stopHistoryObject,
+      bookings,
+      seats,
+      queuePassengers,
+      stops,
+      stopVoting,
+      deposit,
+      commission,
+      isDepositAdded,
+      activeTab,
+      preRaceState,
+      paymentFSM,
+    }
+
+    localStorage.setItem("driverAppState", JSON.stringify(stateToSave))
+  }, [
+    tripStatus,
+    tripId,
+    selectedTrip,
+    isDirectionReversed,
+    currentStopIndex,
+    manualOccupied,
+    areSeatsLocked,
+    isGeoTrackerActive,
+    prepareTimer,
+    visitedStops,
+    stopHistoryMap,
+    bookings,
+    seats,
+    queuePassengers,
+    stops,
+    stopVoting,
+    deposit,
+    commission,
+    isDepositAdded,
+    activeTab,
+    preRaceState,
+    paymentFSM,
+    isStateLoaded,
+  ])
 
   useEffect(() => {
-    localStorage.setItem("driverLanguage", language)
-  }, [language])
+    if (tripStatus === STATE.PREP_TIMER) {
+      const interval = setInterval(() => {
+        setPrepareTimer((prev) => prev - 1)
+      }, 1000)
 
-  useEffect(() => {
-    localStorage.setItem("driverTripState", tripState)
-  }, [tripState])
+      return () => clearInterval(interval)
+    }
+  }, [tripStatus])
 
-  const handleLogin = () => {
-    setAuthState("dashboard")
+  const cycleLanguage = () => {
+    const languages: Language[] = ["ru", "en", "fr", "ar"]
+    const currentIndex = languages.indexOf(language)
+    const nextIndex = (currentIndex + 1) % languages.length
+    setLanguage(languages[nextIndex])
+  }
+
+  const handleLanguageChange = (lang: Language) => {
+    setLanguage(lang)
+  }
+
+  // ============================================================================
+  // FSM ПРЕДРЕЙСОВОГО ЭКРАНА - ФУНКЦИИ
+  // ============================================================================
+
+  const handlePreRaceTransition = (action: PreRaceAction, newRouteId?: string) => {
+    if (!preRaceState) return
+
+    const transition = PRE_RACE_FSM_TRANSITIONS.find(
+      t => t.from === preRaceState && t.action === action
+    )
+
+    if (!transition) {
+      logFSMEvent("fsm:pre_race_blocked", {
+        oldState: preRaceState,
+        action,
+        reason: "invalid_transition"
+      })
+      return
+    }
+
+    logFSMEvent("fsm:pre_race_transition", {
+      oldState: preRaceState,
+      newState: transition.to,
+      action,
+      details: { routeId: newRouteId }
+    })
+
+    setPreRaceState(transition.to)
+
+    // Побочные эффекты переходов
+    if (action === "select_route" && newRouteId) {
+      setSelectedTrip(newRouteId)
+      const selectedRouteData = tripRoutes[newRouteId as keyof typeof tripRoutes]
+      if (selectedRouteData) {
+        setStops(isDirectionReversed ? [...selectedRouteData.stops].reverse() : selectedRouteData.stops)
+      }
+    }
+
+    if (action === "toggle_direction") {
+      setIsDirectionReversed(!isDirectionReversed)
+      if (selectedTrip) {
+        const currentRoute = tripRoutes[selectedTrip as keyof typeof tripRoutes]
+        if (currentRoute) {
+          setStops([...stops].reverse())
+        }
+      }
+    }
+
+    if (action === "start_preparation") {
+      // Переход из предрейсового FSM в FSM рейса
+      setPreRaceState(null)
+    }
+  }
+
+  // ============================================================================
+  // FSM РЕЙСА - ФУНКЦИИ ПЕРЕХОДОВ
+  // ============================================================================
+
+  const clickStartPrep = () => {
+    if (userStatus !== "confirmed") {
+      console.log("[v0] ui:blocked", { action: "startPrep", reason: "accountUnconfirmed" })
+      toast({
+        title: t.error,
+        description: language === "ru" ? "Аккаунт не подтвержден" : "Account not confirmed",
+        variant: "destructive",
+      })
+      return
+    }
+    if (tripStatus !== STATE.PREP_IDLE) {
+      console.error("[v0] Illegal transition: clickStartPrep from", tripStatus)
+      return
+    }
+
+    // Завершаем предрейсовый FSM
+    if (preRaceState === "ready_to_start") {
+      handlePreRaceTransition("start_preparation")
+    }
+
+    setAreSeatsLocked(false)
+    const newTripId = generateTripId()
+    setTripId(newTripId)
+    setTripStatus(STATE.PREP_TIMER)
+    setPrepareTimer(600)
+  }
+
+  const clickCancelPrep = () => {
+    if (tripStatus !== STATE.PREP_TIMER) {
+      console.error("[v0] Illegal transition: clickCancelPrep from", tripStatus)
+      return
+    }
+
+    // Возвращаемся в предрейсовый FSM
+    setPreRaceState("ready_to_start")
+
+    setIsGeoTrackerActive(false)
+    setAreSeatsLocked(true)
+    setPrepareTimer(600)
+    setTripId("")
+    setTripStatus(STATE.PREP_IDLE)
+
     toast({
-      title: language === "ru" ? "Вход выполнен" : "Logged in",
-      description: language === "ru" ? "Добро пожаловать!" : "Welcome!",
+      title: language === "ru" ? "Отменено" : "Cancelled",
+      description: language === "ru" ? "Подготовка рейса отменена" : "Trip preparation cancelled",
     })
   }
 
-  const handleLogout = () => {
-    setAuthState("login")
-    setTripState("idle")
-    localStorage.removeItem("driverAuthState")
-    localStorage.removeItem("driverTripState")
+  const clickStartBoarding = () => {
+    if (tripStatus !== STATE.PREP_TIMER) {
+      console.error("[v0] Illegal transition: clickStartBoarding from", tripStatus)
+      return
+    }
+
+    const raceContext = createRaceContext({
+      currentStopIndex,
+      totalStops: stops.length,
+      freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+      occupiedSeats: manualOccupied,
+      hasActiveReservations: bookings.some((b) => b.fromStopIndex === currentStopIndex && !b.scanned),
+      queueSize: queuePassengers.length,
+      tripId,
+    })
+
+    const validation = validateTransition("RACE_WAITING_START", "start_boarding", raceContext)
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", {
+        oldState: "RACE_WAITING_START",
+        action: "start_boarding",
+        details: { error: validation.error },
+      })
+      toast({
+        title: t.error,
+        description: validation.error,
+        variant: "destructive",
+      })
+      return
+    }
+
+    logFSMEvent("transition:success", {
+      oldState: "RACE_WAITING_START",
+      newState: validation.nextState,
+      action: "start_boarding",
+    })
+
+    setIsGeoTrackerActive(true)
+    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+    setTripStatus(STATE.BOARDING)
+  }
+
+  const clickReadyForRoute = () => {
+    if (tripStatus !== STATE.BOARDING) {
+      console.error("[v0] Illegal transition: clickReadyForRoute from", tripStatus)
+      return
+    }
+    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+    setAreSeatsLocked(true)
+    setTripStatus(STATE.ROUTE_READY)
+  }
+
+  const clickStartRoute = () => {
+    if (tripStatus !== STATE.ROUTE_READY && tripStatus !== STATE.BOARDING) {
+      console.error("[v0] Illegal transition: clickStartRoute from", tripStatus)
+      return
+    }
+
+    const raceContext = createRaceContext({
+      currentStopIndex,
+      totalStops: stops.length,
+      freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+      occupiedSeats: manualOccupied,
+      hasActiveReservations: bookings.some(b => b.fromStopIndex === currentStopIndex && !b.scanned),
+      queueSize: queuePassengers.length,
+      tripId,
+    })
+
+    const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
+    const action = currentRaceState === "RACE_BOARDING" ? "depart_stop" : "continue_boarding"
+
+    const validation = validateTransition(currentRaceState, action, raceContext)
+    
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", {
+        oldState: currentRaceState,
+        action: action,
+        details: { error: validation.error }
+      })
+      toast({
+        title: t.error,
+        description: validation.error,
+        variant: "destructive",
+      })
+      return
+    }
+    
+    logFSMEvent("transition:success", {
+      oldState: currentRaceState,
+      newState: validation.nextState,
+      action: action,
+    })
+
+    const reservedCount = bookings
+      .filter((b) => b.fromStopIndex === currentStopIndex && !b.scanned)
+      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+    const boardedCount = bookings
+      .filter((b) => b.fromStopIndex === currentStopIndex && b.scanned)
+      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+    setStopHistoryMap((prev) => {
+      const newMap = new Map(prev)
+      newMap.set(currentStopIndex, {
+        stopId: currentStopIndex,
+        reserved: reservedCount,
+        boarded: boardedCount,
+      })
+      return newMap
+    })
+
+    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+
+    if (currentStopIndex + 1 >= stops.length - 1) {
+      setCurrentStopIndex(stops.length - 1)
+      setTripStatus(STATE.FINISHED)
+    } else {
+      setCurrentStopIndex(currentStopIndex + 1)
+      setAreSeatsLocked(true)
+      setTripStatus(STATE.IN_ROUTE)
+    }
+  }
+  const clickArrivedAtStop = () => {
+    if (tripStatus !== STATE.IN_ROUTE) {
+      console.error("[v0] Illegal transition: clickArrivedAtStop from", tripStatus)
+      return
+    }
+
+    const raceContext = createRaceContext({
+      currentStopIndex,
+      totalStops: stops.length,
+      freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+      occupiedSeats: manualOccupied,
+      hasActiveReservations: bookings.some((b) => b.fromStopIndex === currentStopIndex && !b.scanned),
+      queueSize: queuePassengers.length,
+      tripId,
+    })
+
+    const validation = validateTransition("RACE_IN_TRANSIT", "arrive_stop", raceContext)
+
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", {
+        oldState: "RACE_IN_TRANSIT",
+        action: "arrive_stop",
+        details: { error: validation.error },
+      })
+      toast({
+        title: t.error,
+        description: validation.error,
+        variant: "destructive",
+      })
+      return
+    }
+
+    logFSMEvent("transition:success", {
+      oldState: "RACE_IN_TRANSIT",
+      newState: validation.nextState,
+      action: "arrive_stop",
+    })
+
+    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+
+    const stopBookings = bookings.filter((b) => b.fromStopIndex === currentStopIndex)
+
+    const reservedCount = stopBookings
+      .filter((b) => !b.scanned)
+      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+    const boardedCount = stopBookings
+      .filter((b) => b.scanned)
+      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+    setStopHistoryMap((prev) => {
+      const newMap = new Map(prev)
+      newMap.set(currentStopIndex, {
+        stopId: currentStopIndex,
+        reserved: reservedCount,
+        boarded: boardedCount,
+      })
+      return newMap
+    })
+
+    if (currentStopIndex === stops.length - 1) {
+      setTripStatus(STATE.FINISHED)
+    } else {
+      setAreSeatsLocked(false)
+      setTripStatus(STATE.BOARDING)
+    }
+  }
+
+  const clickFinish = () => {
+    if (tripStatus !== "FINISHED") {
+      console.error("[v0] Illegal transition: clickFinish from", tripStatus)
+      return
+    }
+
+    const raceContext = createRaceContext({
+      currentStopIndex,
+      totalStops: stops.length,
+      freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+      occupiedSeats: manualOccupied,
+      hasActiveReservations: bookings.some((b) => b.fromStopIndex === currentStopIndex && !b.scanned),
+      queueSize: queuePassengers.length,
+      tripId,
+    })
+
+    const validation = validateTransition("RACE_FINISHED", "end_shift", raceContext)
+
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", {
+        oldState: "RACE_FINISHED",
+        action: "end_shift",
+        details: { error: validation.error },
+      })
+      toast({
+        title: t.error,
+        description: validation.error,
+        variant: "destructive",
+      })
+      return
+    }
+
+    logFSMEvent("transition:success", {
+      oldState: "RACE_FINISHED",
+      newState: validation.nextState,
+      action: "end_shift",
+    })
+
+    // Возвращаемся в предрейсовый FSM
+    setPreRaceState("route_selection")
+
+    setIsGeoTrackerActive(false)
+    setAreSeatsLocked(true)
+    setPrepareTimer(600)
+    setTripId("")
+    setSelectedTrip("")
+    setIsDirectionReversed(false)
+    setTripStatus(STATE.PREP_IDLE)
+    setCurrentStopIndex(0)
+    setVisitedStops(new Set())
+    setStopHistoryMap(new Map())
+    setStopVoting({
+      1: [
+        { id: 1, timeLeft: 60, passengerCount: 2 },
+        { id: 2, timeLeft: 60, passengerCount: 3 },
+      ],
+      2: [{ id: 1, timeLeft: 60, passengerCount: 1 }],
+    })
+    setManualOccupied(0)
+    setIsDepositAdded(false)
+
+    // Сброс FSM оплаты
+    setPaymentFSM({
+      state: "idle",
+      context: {
+        paymentType: "cash",
+        amount: 0,
+      }
+    })
+
+    setBookings([
+      {
+        id: 1,
+        passengerName: "Ольга В.",
+        pickupTime: "14:15",
+        pickupLocation: tripRoutes["247"].stops[1].name,
+        fromStopIndex: 1,
+        toStopIndex: 3,
+        amount: 320,
+        count: 1,
+        passengerCount: 1,
+      },
+      {
+        id: 2,
+        passengerName: "Дмитрий Н.",
+        pickupTime: "14:15",
+        pickupLocation: tripRoutes["247"].stops[1].name,
+        fromStopIndex: 1,
+        toStopIndex: 3,
+        amount: 320,
+        count: 2,
+        passengerCount: 1,
+      },
+      {
+        id: 3,
+        passengerName: "Елена Т.",
+        pickupTime: "14:45",
+        pickupLocation: tripRoutes["247"].stops[2].name,
+        fromStopIndex: 2,
+        toStopIndex: 3,
+        amount: 180,
+        count: 1,
+        passengerCount: 1,
+      },
+    ])
+
+    setSeats([
+      {
+        id: 1,
+        status: "occupied",
+        passengerName: "Иван П.",
+        fromStop: 0,
+        toStop: 3,
+        paymentMethod: "qr",
+        amountPaid: 450,
+      },
+      {
+        id: 2,
+        status: "occupied",
+        passengerName: "Мария С.",
+        fromStop: 0,
+        toStop: 2,
+        paymentMethod: "cash",
+        amountPaid: 280,
+      },
+      { id: 3, status: "free" },
+      { id: 4, status: "free" },
+      {
+        id: 5,
+        status: "occupied",
+        passengerName: "Алексей К.",
+        fromStop: 0,
+        toStop: 3,
+        paymentMethod: "qr",
+        amountPaid: 380,
+      },
+      { id: 6, status: "free" },
+    ])
+
+    setQueuePassengers([
+      { id: 1, name: "Петр С.", queuePosition: 1, isFirst: true, count: 1, ticketCount: 1, orderNumber: 1, fsmState: "waiting" },
+      { id: 2, name: "Анна М.", queuePosition: 2, isFirst: false, count: 2, ticketCount: 2, orderNumber: 2, fsmState: "waiting" },
+      { id: 3, name: "Игорь Л.", queuePosition: 3, isFirst: false, count: 1, ticketCount: 1, orderNumber: 3, fsmState: "waiting" },
+      { id: 4, name: "Ольга К.", queuePosition: 4, isFirst: false, count: 3, ticketCount: 3, orderNumber: 4, fsmState: "waiting" },
+      { id: 5, name: "Сергей Д.", queuePosition: 5, isFirst: false, count: 1, ticketCount: 1, orderNumber: 5, fsmState: "waiting" },
+    ])
+  }
+
+  const getTripButtonText = () => {
+    const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
+    const buttonConfig = getButtonConfig(currentRaceState, language)
+    
+    if (tripStatus === STATE.PREP_TIMER) {
+      return `${t.prepareTrip} ${formatTimer(prepareTimer)}`
+    }
+    
+    if (tripStatus === STATE.BOARDING && currentStopIndex > 0) {
+      return language === "ru" ? "Посадка завершена" : "Boarding Complete"
+    }
+    
+    if (tripStatus === STATE.ROUTE_READY && currentStopIndex > 0) {
+      return language === "ru" ? "Продолжить рейс" : "Continue Trip"
+    }
+    
+    if (tripStatus === STATE.IN_ROUTE) {
+      const stopName = stops[currentStopIndex]?.name || ""
+      return language === "ru" ? `Прибыл ${stopName}` : `Arrived ${stopName}`
+    }
+    
+    return buttonConfig.label
+  }
+
+  const getTripStatusEmoji = () => {
+    if (tripStatus === STATE.IN_ROUTE) return "🚌"
+    if (tripStatus === STATE.ROUTE_READY) return "🚦"
+    if (tripStatus === STATE.BOARDING) return "👥"
+    if (tripStatus === STATE.PREP_TIMER) return "⏱️"
+    return "⏸️"
+  }
+
+  const formatTimer = (seconds: number) => {
+    const isNegative = seconds < 0
+    const absSeconds = Math.abs(seconds)
+    const mins = Math.floor(absSeconds / 60)
+    const secs = absSeconds % 60
+    const timeStr = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
+    return isNegative ? `-${timeStr}` : timeStr
+  }
+
+  const handleTripButton = () => {
+    if (tripStatus === STATE.PREP_IDLE) {
+      clickStartPrep()
+    } else if (tripStatus === STATE.PREP_TIMER) {
+      clickStartBoarding()
+    } else if (tripStatus === STATE.BOARDING) {
+      if (currentStopIndex === 0) {
+        clickStartRoute()
+      } else {
+        clickReadyForRoute()
+      }
+    } else if (tripStatus === STATE.ROUTE_READY) {
+      clickStartRoute()
+    } else if (tripStatus === STATE.IN_ROUTE) {
+      clickArrivedAtStop()
+    } else if (tripStatus === STATE.FINISHED) {
+      clickFinish()
+    }
+  }
+
+  // ============================================================================
+  // ОБРАБОТЧИКИ БРОНИРОВАНИЙ
+  // ============================================================================
+
+  const handleOpenBookingScanner = (bookingId: number) => {
+    if (areSeatsLocked) {
+      console.log("[v0] ui:blocked", { action: "openBookingScanner", reason: "seatsLocked" })
+      toast({
+        title: t.error,
+        description: language === "ru" ? "Сначала начните подготовку рейса" : "Start trip preparation first",
+        variant: "destructive",
+      })
+      return
+    }
+
+    if (isScanningLocked) {
+      console.log("[v0] ui:blocked", { action: "openBookingScanner", reason: "scanningInProgress" })
+      return
+    }
+
+    if (userStatus !== "confirmed") {
+      console.log("[v0] ui:blocked", { action: "openBookingScanner", reason: "accountUnconfirmed" })
+      toast({
+        title: t.error,
+        description: language === "ru" ? "Аккаунт не подтвержден" : "Account not confirmed",
+        variant: "destructive",
+      })
+      return
+    }
+
+    console.log("[v0] scan:start", { bookingId, timestamp: new Date().toISOString() })
+    
+    // FSM оплаты: переход в scan_qr
+    setPaymentFSM({
+      state: "scan_qr",
+      context: {
+        paymentType: "booking",
+        amount: bookings.find(b => b.id === bookingId)?.amount || 0,
+        passengerId: bookingId,
+      }
+    })
+
+    setIsScanningLocked(true)
+    setTempBookingId(bookingId)
+    setScanningForQueue(false)
+    setCurrentQueueScanId(null)
+    setShowCashQRDialog(true)
+    setTimeout(() => setIsScanningLocked(false), 300)
+  }
+
+  const handleReturnBooking = (bookingId: number) => {
+    console.log("[v0] return:clicked", { bookingId, timestamp: new Date().toISOString() })
+
+    const booking = bookings.find((b) => b.id === bookingId)
+    if (!booking) {
+      console.log("[v0] return:error", { bookingId, reason: "booking_not_found" })
+      return
+    }
+
+    if (booking.reserved) {
+      console.log("[v0] accept:clicked", {
+        bookingId: bookingId,
+        amount: booking.amount,
+        timestamp: new Date().toISOString(),
+      })
+      handleOpenBookingScanner(bookingId)
+    }
+  }
+
+  const handleReturnQueuePassenger = (passengerId: number) => {
+    console.log("[v0] return:clicked", { passengerId, timestamp: new Date().toISOString() })
+
+    const passenger = queuePassengers.find((p) => p.id === passengerId)
+    if (!passenger) {
+      console.log("[v0] return:error", { passengerId, reason: "passenger_not_found" })
+      return
+    }
+
+    // FSM очереди: переход revert_scan
+    setQueuePassengers(
+      queuePassengers.map((p) =>
+        p.id === passengerId
+          ? {
+              ...p,
+              fsmState: "waiting" as QueuePassengerState,
+              qrData: undefined,
+            }
+          : p,
+      ),
+    )
+
+    const seatCountToRevert = passenger.ticketCount || 1
+    setManualOccupied((prev) => Math.max(0, prev - seatCountToRevert))
+
+    console.log("[v0] return:success", {
+      passengerId,
+      seatCountReverted: seatCountToRevert,
+      timestamp: new Date().toISOString(),
+    })
+
     toast({
-      title: language === "ru" ? "Выход выполнен" : "Logged out",
+      title: language === "ru" ? "Возврат" : "Return",
+      description: language === "ru" ? "Операция отменена" : "Operation canceled",
     })
   }
 
-  const handleRegister = () => {
-    setAuthState("awaiting")
+  const handleAcceptBooking = (bookingId: number) => {
+    const booking = bookings.find((b) => b.id === bookingId)
+    if (!booking) return
+
+    if (booking.reserved) {
+      console.log("[v0] accept:clicked", {
+        bookingId: bookingId,
+        amount: booking.amount,
+        timestamp: new Date().toISOString(),
+      })
+      handleOpenBookingScanner(bookingId)
+    }
   }
 
-  const handleTripStateChange = (newState: TripState) => {
-    setTripState(newState)
+  const handleReserveBooking = (bookingId: number) => {
+    if (areSeatsLocked) {
+      console.log("[v0] ui:blocked", { action: "reserveBooking", reason: "seatsLocked" })
+      toast({
+        title: t.error,
+        description: language === "ru" ? "Сначала начните подготовку рейса" : "Start trip preparation first",
+        variant: "destructive",
+      })
+      return
+    }
+
+    const booking = bookings.find((b) => b.id === bookingId)
+    if (!booking) return
+
+    const freeSeatsCount = 6 - manualOccupied - acceptedBookingsCount
+    const bookingCount = booking.count || 1
+
+    if (freeSeatsCount < bookingCount) {
+      console.log("[v0] ui:blocked", { action: "reserveBooking", reason: "noFreeSeats" })
+      toast({
+        title: t.error,
+        description: language === "ru" ? "Недостаточно свободных мест" : "Not enough free seats",
+        variant: "destructive",
+      })
+      return
+    }
+
+    console.log("[v0] booking:reserved", {
+      bookingId,
+      count: bookingCount,
+      timestamp: new Date().toISOString(),
+    })
+
+    setBookings(
+      bookings.map((b) =>
+        b.id === bookingId
+          ? {
+              ...b,
+              reserved: true,
+              accepted: true,
+            }
+          : b,
+      ),
+    )
+
+    toast({
+      title: language === "ru" ? "Бронь принята" : "Booking reserved",
+      description: `${booking.passengerName} - ${language === "ru" ? "место зарезервировано" : "seat reserved"}`,
+    })
   }
 
-  const handleAcceptPassenger = (passengerId: number) => {
-    setPassengers(prev => prev.filter(p => p.id !== passengerId))
+  const handleRejectBooking = (bookingId: number) => {
+    const booking = bookings.find((b) => b.id === bookingId)
+    if (!booking) return
+
+    console.log("[v0] booking:rejected", {
+      bookingId,
+      reason: "driver_rejected",
+      timestamp: new Date().toISOString(),
+    })
+
+    setBookings(bookings.filter((b) => b.id !== bookingId))
+
+    toast({
+      title: language === "ru" ? "Бронь отклонена" : "Booking rejected",
+      description: booking.passengerName,
+      variant: "destructive",
+    })
+  }
+  const handleCancelBooking = (bookingId: number, isOnCurrentStop: boolean) => {
+    setCancelBookingId(bookingId)
+    setCancelReason("")
+    setBookings((prev) =>
+      prev.map((b) => (b.id === bookingId ? { ...b, cancelContext: isOnCurrentStop ? "boarding" : "future_stop" } : b)),
+    )
+    setShowCancelDialog(true)
+  }
+
+  const confirmCancelBooking = () => {
+    if (!cancelBookingId || !cancelReason) return
+
+    const booking = bookings.find((b) => b.id === cancelBookingId)
+    if (!booking) return
+
+    console.log("[v0] booking:cancelled", {
+      bookingId: cancelBookingId,
+      reason: cancelReason,
+      timestamp: new Date().toISOString(),
+    })
+
+    setBookings(bookings.filter((b) => b.id !== cancelBookingId))
+
+    toast({
+      title: language === "ru" ? "Бронь отменена" : "Booking cancelled",
+      description: `${booking.passengerName} - ${cancelReason}`,
+      variant: "destructive",
+    })
+
+    setShowCancelDialog(false)
+    setCancelBookingId(null)
+    setCancelReason("")
+  }
+
+  const handleAcceptBookingQR = (bookingId: number) => {
+    const booking = bookings.find((b) => b.id === bookingId)
+    if (!booking || !booking.qrData) return
+
+    console.log("[v0] accept:clicked", {
+      bookingId: bookingId,
+      amount: booking.amount,
+      timestamp: new Date().toISOString(),
+    })
+
+    // FSM оплаты: переход к success
+    setPaymentFSM({
+      state: "success",
+      context: {
+        ...paymentFSM.context,
+        amount: booking.amount,
+      }
+    })
+
+    const bookingCount = booking.count || 1
+    const updatedSeats = [...seats]
+    let seatsToOccupy = bookingCount
+
+    for (let i = 0; i < updatedSeats.length && seatsToOccupy > 0; i++) {
+      if (updatedSeats[i].status === "free") {
+        updatedSeats[i] = {
+          ...updatedSeats[i],
+          status: "occupied",
+          passengerName: booking.passengerName,
+          fromStop: booking.fromStopIndex,
+          toStop: booking.toStopIndex,
+          paymentMethod: "qr",
+          amountPaid: booking.amount / bookingCount,
+        }
+        seatsToOccupy--
+      }
+    }
+
+    setSeats(updatedSeats)
+    setBalance(balance + booking.amount)
+
+    setBookings((prev) =>
+      prev.map((b) => (b.id === bookingId ? { ...b, scanned: true, accepted: true, showQRButtons: false } : b)),
+    )
+
+    // Сброс FSM оплаты
+    setTimeout(() => {
+      setPaymentFSM({
+        state: "idle",
+        context: {
+          paymentType: "cash",
+          amount: 0,
+        }
+      })
+    }, 1000)
+
+    toast({
+      title: language === "ru" ? "Бронь принята" : "Booking accepted",
+      description: `${booking.passengerName} - ${formatCurrency(booking.amount)} RUB`,
+    })
+  }
+
+  const handleRejectBookingQR = (bookingId: number) => {
+    const booking = bookings.find((b) => b.id === bookingId)
+    if (!booking) return
+
+    console.log("[v0] reject:clicked", {
+      bookingId: bookingId,
+      reason: "driver_rejected_valid_qr",
+      timestamp: new Date().toISOString(),
+    })
+
+    // FSM оплаты: переход к idle
+    setPaymentFSM({
+      state: "idle",
+      context: {
+        paymentType: "cash",
+        amount: 0,
+      }
+    })
+
+    setBookings(bookings.filter((b) => b.id !== bookingId))
+
+    toast({
+      title: language === "ru" ? "Бронь отклонена" : "Booking rejected",
+      description: booking.passengerName,
+      variant: "destructive",
+    })
+  }
+
+  const handleRevertBookingQR = (bookingId: number) => {
+    console.log("[v0] Reverting booking QR:", bookingId)
+    
+    // FSM оплаты: возврат к idle
+    setPaymentFSM({
+      state: "idle",
+      context: {
+        paymentType: "cash",
+        amount: 0,
+      }
+    })
+
+    setBookings(bookings.map((b) => (b.id === bookingId ? { ...b, showQRButtons: false, qrData: undefined } : b)))
+  }
+
+  const handleRevertPassengerQR = (passengerId: number) => {
+    console.log("[v0] Reverting passenger QR:", passengerId)
+    const passenger = queuePassengers.find((p) => p.id === passengerId)
+    if (!passenger) return
+
+    const seatsToFree = passenger.ticketCount
+    setSeats((prevSeats) => {
+      const occupiedSeats = prevSeats.filter((s) => s.status === "occupied" && s.passengerName === passenger.name)
+      const seatsToUpdate = occupiedSeats.slice(0, seatsToFree)
+      return prevSeats.map((seat) =>
+        seatsToUpdate.find((s) => s.id === seat.id)
+          ? {
+              ...seat,
+              status: "free" as const,
+              passengerName: undefined,
+              fromStop: undefined,
+              toStop: undefined,
+              paymentMethod: undefined,
+              amountPaid: undefined,
+            }
+          : seat,
+      )
+    })
+
+    setQueuePassengers(
+      queuePassengers.map((p) => (p.id === passengerId ? { ...p, fsmState: "waiting" as QueuePassengerState, qrData: undefined } : p)),
+    )
+  }
+
+  const handleConfirmQR = () => {
+    if (tempBookingId !== null && tempBookingId !== undefined) {
+      const booking = bookings.find((b) => b.id === tempBookingId)
+      if (!booking) return
+
+      console.log("[v0] scan:result", {
+        bookingId: tempBookingId,
+        stopId: booking.fromStopIndex,
+        match: true,
+        timestamp: new Date().toISOString(),
+      })
+
+      const mockQRData = {
+        sum: booking.amount,
+        recipient: language === "ru" ? "Водитель Иванов И.И." : "Driver Ivanov I.",
+        created_at: formatDateTime(new Date(Date.now() - Math.floor(Math.random() * 3600000))),
+      }
+
+      // FSM оплаты: переход к confirm
+      setPaymentFSM({
+        state: "confirm",
+        context: {
+          ...paymentFSM.context,
+          qrData: mockQRData,
+        }
+      })
+
+      setBookings(
+        bookings.map((b) =>
+          b.id === tempBookingId
+            ? {
+                ...b,
+                showQRButtons: true,
+                qrData: mockQRData,
+                qrError: undefined,
+                scanned: true,
+              }
+            : b,
+        ),
+      )
+
+      setTimeout(() => {
+        setShowCashQRDialog(false)
+        setIsScanningLocked(false)
+      }, 1500)
+    } else if (scanningForQueue || currentQueueScanId !== null) {
+      const passenger = queuePassengers.find((p) => p.id === currentQueueScanId)
+      if (!passenger) return
+
+      console.log("[v0] scan:result", {
+        passengerId: currentQueueScanId,
+        match: true,
+        timestamp: new Date().toISOString(),
+      })
+
+      const mockQRData = {
+        sum: passenger.ticketCount * 320,
+        recipient: language === "ru" ? "Водитель Иванов И.И." : "Driver Ivanov I.",
+        created_at: formatDateTime(new Date(Date.now() - Math.floor(Math.random() * 3600000))),
+      }
+
+      setQueuePassengers(
+        queuePassengers.map((p) =>
+          p.id === currentQueueScanId
+            ? {
+                ...p,
+                fsmState: "scan_success" as QueuePassengerState,
+                qrData: mockQRData,
+              }
+            : p,
+        ),
+      )
+
+      setTimeout(() => {
+        setShowCashQRDialog(false)
+        setIsScanningLocked(false)
+      }, 1500)
+    }
+  }
+
+  const handleInvalidQR = () => {
+    console.log("[v0] scan:error", {
+      bookingId: tempBookingId || currentQueueScanId,
+      error: "Invalid QR",
+      timestamp: new Date().toISOString(),
+    })
+
+    // FSM оплаты: переход к error
+    setPaymentFSM({
+      state: "error",
+      context: {
+        ...paymentFSM.context,
+        errorMessage: "Invalid QR code"
+      }
+    })
+
+    toast({
+      title: t.scanError,
+      description: t.invalidQR,
+      variant: "destructive",
+    })
+  }
+
+  const handleQRNotFoundForBooking = () => {
+    console.log("[v0] qr:not_found_clicked", {
+      bookingId: tempBookingId || currentQueueScanId,
+      timestamp: new Date().toISOString(),
+    })
+
+    // FSM оплаты: переход к error
+    setPaymentFSM({
+      state: "error",
+      context: {
+        ...paymentFSM.context,
+        errorMessage: "QR not found"
+      }
+    })
+
+    if (tempBookingId !== null && tempBookingId !== undefined) {
+      setBookings(
+        bookings.map((b) =>
+          b.id === tempBookingId
+            ? {
+                ...b,
+                qrError: language === "ru" ? "QR не найден" : "QR not found",
+                showRejectButton: true,
+              }
+            : b,
+        ),
+      )
+    } else if (currentQueueScanId !== null) {
+      setQueuePassengers(
+        queuePassengers.map((p) =>
+          p.id === currentQueueScanId
+            ? {
+                ...p,
+                fsmState: "scan_error" as QueuePassengerState,
+              }
+            : p,
+        ),
+      )
+    }
+
+    setShowCashQRDialog(false)
+    setIsScanningLocked(false)
+  }
+
+  // ============================================================================
+  // ОБРАБОТЧИКИ ОЧЕРЕДИ (используют FSM из компонента)
+  // ============================================================================
+
+  const handleAcceptQueuePassenger = (passengerId: number) => {
+    const passenger = queuePassengers.find((p) => p.id === passengerId)
+    if (!passenger || passenger.fsmState !== "scan_success") return
+
+    console.log("[v0] accept:clicked", {
+      passengerId: passengerId,
+      count: passenger.ticketCount,
+      timestamp: new Date().toISOString(),
+    })
+
+    const passengerCount = passenger.ticketCount || 1
+    setManualOccupied((prev) => prev + passengerCount)
+
+    let seatsToOccupy = passengerCount
+    const updatedSeats = [...seats]
+
+    for (let i = 0; i < updatedSeats.length && seatsToOccupy > 0; i++) {
+      if (updatedSeats[i].status === "free") {
+        updatedSeats[i] = {
+          ...updatedSeats[i],
+          status: "occupied",
+          passengerName: passenger.name,
+          paymentMethod: "qr",
+          fromStop: stops.findIndex((s) => s.id === 0),
+          toStop: stops.length - 1,
+        }
+        seatsToOccupy--
+      }
+    }
+
+    setSeats(updatedSeats)
+    
+    // Удаляем пассажира из очереди (FSM: accepted)
+    setQueuePassengers(queuePassengers.filter((p) => p.id !== passengerId))
+    setQrScannedData(null)
+
     toast({
       title: language === "ru" ? "Пассажир принят" : "Passenger accepted",
+      description: `${passenger.name}`,
     })
   }
 
-  const handleRejectPassenger = (passengerId: number) => {
-    setPassengers(prev => prev.filter(p => p.id !== passengerId))
+  const handleRejectQueuePassenger = (passengerId: number) => {
+    console.log("[v0] reject:clicked", {
+      passengerId: passengerId,
+      timestamp: new Date().toISOString(),
+    })
+
+    // Удаляем пассажира из очереди (FSM: rejected)
+    setQueuePassengers(queuePassengers.filter((p) => p.id !== passengerId))
+    setQrScannedData(null)
+
     toast({
       title: language === "ru" ? "Пассажир отклонён" : "Passenger rejected",
       variant: "destructive",
     })
   }
 
-  const handleReturnPassenger = (passengerId: number) => {
-    // Already handled in QueueQRScanner
+  const handleQRScanError = () => {
+    toast({
+      title: t.scanError,
+      description: t.invalidQR,
+      variant: "destructive",
+    })
   }
 
-  const languageOptions = [
-    { code: "fr" as Language, name: "Français", flag: "FR" },
-    { code: "ar" as Language, name: "العربية", flag: "AR" },
-    { code: "darija-ar" as Language, name: "الدارجة", flag: "MA" },
-    { code: "darija-latin" as Language, name: "Darija", flag: "MA" },
-    { code: "amazigh-ar" as Language, name: "ⴰⵎⴰⵣⵉⵖ", flag: "MA" },
-    { code: "amazigh-latin" as Language, name: "Tamazight", flag: "MA" },
-    { code: "es" as Language, name: "Español", flag: "ES" },
-    { code: "en" as Language, name: "English", flag: "EN" },
-    { code: "ru" as Language, name: "Русский", flag: "RU" },
-  ]
+  const handleLogout = () => {
+    localStorage.removeItem("driverAuthenticated")
+    localStorage.removeItem("userStatus")
+    setIsAuthenticated(false)
+    setUserStatus("pending")
+    setTripStatus(STATE.PREP_IDLE)
+    setTripId("")
+    setSelectedTrip("")
+    setAreSeatsLocked(true)
+    
+    // Сброс FSM состояний
+    setPreRaceState("route_selection")
+    setPaymentFSM({
+      state: "idle",
+      context: {
+        paymentType: "cash",
+        amount: 0,
+      }
+    })
+  }
 
-  // Login screen
-  if (authState === "login") {
+  const handleToggleDirection = () => {
+    if (preRaceState === "direction_selection" || preRaceState === "route_confirmed") {
+      handlePreRaceTransition("toggle_direction")
+    }
+  }
+
+  const handleRejectQRNotFoundBooking = (bookingId: number) => {
+    const booking = bookings.find((b) => b.id === bookingId)
+    if (!booking) return
+
+    console.log("[v0] reject:clicked", {
+      bookingId: bookingId,
+      reason: "qr_not_found",
+      timestamp: new Date().toISOString(),
+    })
+
+    const currentBooking = bookings.find((b) => b.id === bookingId)
+    if (currentBooking) {
+      const stopBookings = bookings.filter(
+        (b) => b.fromStopIndex === currentBooking.fromStopIndex && b.id !== bookingId && !b.accepted && !b.qrError,
+      )
+
+      if (stopBookings.length > 0 && highlightedBookingId) {
+        const nextBooking = stopBookings.find((b) => b.id === highlightedBookingId)
+        if (nextBooking) {
+          console.log("[v0] Opening scanner for highlighted booking:", nextBooking.id)
+
+          setBookings(bookings.filter((b) => b.id !== bookingId))
+
+          setTimeout(() => {
+            setTempBookingId(nextBooking.id)
+            setScanningForQueue(false)
+            setCurrentQueueScanId(null)
+            setShowCashQRDialog(true)
+          }, 300)
+
+          return
+        }
+      }
+    }
+
+    setBookings(bookings.filter((b) => b.id !== bookingId))
+    setHighlightedBookingId(null)
+
+    toast({
+      title: language === "ru" ? "Бронь отклонена" : "Booking rejected",
+      description: booking.passengerName,
+      variant: "destructive",
+    })
+  }
+
+  const handleRejectQueuePassengerError = (passengerId: number) => {
+    const passenger = queuePassengers.find((p) => p.id === passengerId)
+    if (!passenger) return
+
+    console.log("[v0] Rejecting queue passenger with QR error:", passengerId)
+
+    const nextPassenger = queuePassengers.find((p) => p.fsmState === "waiting")
+
+    setQueuePassengers(queuePassengers.filter((p) => p.id !== passengerId))
+
+    if (nextPassenger) {
+      console.log("[v0] Opening scanner for next queue passenger:", nextPassenger.id)
+
+      toast({
+        title: language === "ru" ? "Пассажир отклонён" : "Passenger rejected",
+        description: language === "ru" ? `Следующий: ${nextPassenger.name}` : `Next: ${nextPassenger.name}`,
+      })
+
+      setTimeout(() => {
+        setCurrentQueueScanId(nextPassenger.id)
+        setScanningForQueue(true)
+        setTempBookingId(null)
+        setShowCashQRDialog(true)
+      }, 300)
+    } else {
+      toast({
+        title: language === "ru" ? "Пассажир отклонён" : "Passenger rejected",
+        description: passenger.name,
+        variant: "destructive",
+      })
+    }
+  }
+
+  const handleSelectRoute = (tripNumber: string) => {
+    if (userStatus !== "confirmed") {
+      console.log("[v0] ui:blocked", { action: "selectRoute", reason: "accountUnconfirmed" })
+      toast({
+        title: t.error,
+        description: language === "ru" ? "Аккаунт не подтвержден" : "Account not confirmed",
+        variant: "destructive",
+      })
+      return
+    }
+
+    // FSM предрейсового экрана: переход select_route
+    handlePreRaceTransition("select_route", tripNumber)
+  }
+  useEffect(() => {
+    if (!selectedTrip) return
+    const currentRoute = tripRoutes[selectedTrip as keyof typeof tripRoutes]
+    if (currentRoute) {
+      setStops(isDirectionReversed ? [...currentRoute.stops].reverse() : currentRoute.stops)
+    }
+  }, [selectedTrip, isDirectionReversed])
+
+  useEffect(() => {
+    const actualOccupied = seats.filter((s) => s.status === "occupied").length
+    setManualOccupied(actualOccupied)
+  }, [seats])
+
+  useEffect(() => {
+    setIsRouteDropdownDisabled(tripStatus !== STATE.PREP_IDLE)
+  }, [tripStatus])
+
+  const handleScanQueueQR = () => {
+    if (areSeatsLocked) {
+      console.log("[v0] ui:blocked", {
+        action: "openQueueScanner",
+        reason: "seatsLocked",
+      })
+      return
+    }
+
+    if (scanInProgressRef.current) {
+      console.log("[v0] ui:blocked", {
+        action: "openQueueScanner",
+        reason: "scanAlreadyInProgress",
+      })
+      return
+    }
+
+    const nextPassenger = queuePassengers.find((p) => p.fsmState === "waiting")
+    if (!nextPassenger) {
+      toast({
+        title: language === "ru" ? "Нет пассажиров для сканирования" : "No passengers to scan",
+        description: language === "ru" ? "Все пассажиры в очереди обработаны" : "All passengers in queue processed",
+      })
+      return
+    }
+
+    setCurrentQueueScanId(nextPassenger.id)
+    scanInProgressRef.current = true
+    setIsScanningLocked(true)
+
+    console.log("[v0] scan:start", {
+      passengerId: nextPassenger.id,
+      timestamp: new Date().toISOString(),
+    })
+
+    setShowCashQRDialog(true)
+  }
+
+  const handleQueuePassengerScan = (qrResult: {
+    match: boolean
+    ticketId?: string
+    sum?: number
+    recipient?: string
+    created_at?: string
+  }) => {
+    if (!currentQueueScanId) {
+      setIsScanningLocked(false)
+      scanInProgressRef.current = false
+      return
+    }
+
+    const passengerIndex = queuePassengers.findIndex((p) => p.id === currentQueueScanId)
+    if (passengerIndex === -1) {
+      setIsScanningLocked(false)
+      scanInProgressRef.current = false
+      return
+    }
+
+    const updatedPassengers = [...queuePassengers]
+    const passenger = updatedPassengers[passengerIndex]
+
+    if (qrResult.match) {
+      console.log("[v0] scan:result", {
+        passengerId: currentQueueScanId,
+        match: true,
+        ticketId: qrResult.ticketId,
+        timestamp: new Date().toISOString(),
+      })
+
+      updatedPassengers[passengerIndex] = {
+        ...passenger,
+        fsmState: "scan_success" as QueuePassengerState,
+        qrData: {
+          sum: qrResult.sum || 0,
+          recipient: qrResult.recipient || "",
+          created_at: qrResult.created_at || "",
+        },
+      }
+      setQueuePassengers(updatedPassengers)
+
+      setQrScannedData({
+        amount: qrResult.sum || 0,
+        recipient: qrResult.recipient || "",
+        createdAt: qrResult.created_at || "",
+        scannedPassengerId: currentQueueScanId,
+      })
+    } else {
+      console.log("[v0] scan:error", {
+        passengerId: currentQueueScanId,
+        error: "QR не найден",
+        timestamp: new Date().toISOString(),
+      })
+
+      updatedPassengers[passengerIndex] = {
+        ...passenger,
+        fsmState: "scan_error" as QueuePassengerState,
+      }
+      setQueuePassengers(updatedPassengers)
+
+      toast({
+        title: language === "ru" ? "QR не найден" : "QR not found",
+        description: language === "ru" ? "Неверный или недействительный QR-код" : "Invalid or expired QR code",
+        variant: "destructive",
+      })
+
+      console.log("[v0] qr:not_found_clicked", {
+        passengerId: currentQueueScanId,
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    setCurrentQueueScanId(null)
+    setIsScanningLocked(false)
+    scanInProgressRef.current = false
+  }
+
+  const handleOpenPassengerScanner = (passengerId: number) => {
+    if (areSeatsLocked) {
+      console.log("[v0] ui:blocked", { action: "openPassengerScanner", reason: "seatsLocked" })
+      toast({
+        title: t.error,
+        description: language === "ru" ? "Сначала начните подготовку рейса" : "Start trip preparation first",
+        variant: "destructive",
+      })
+      return
+    }
+
+    if (isScanningLocked) {
+      console.log("[v0] ui:blocked", { action: "openPassengerScanner", reason: "scanningInProgress" })
+      return
+    }
+
+    if (userStatus !== "confirmed") {
+      console.log("[v0] ui:blocked", { action: "openPassengerScanner", reason: "accountUnconfirmed" })
+      toast({
+        title: t.error,
+        description: language === "ru" ? "Аккаунт не подтвержден" : "Account not confirmed",
+        variant: "destructive",
+      })
+      return
+    }
+
+    console.log("[v0] scan:start", { passengerId, timestamp: new Date().toISOString() })
+    setIsScanningLocked(true)
+    setCurrentQueueScanId(passengerId)
+    setScanningForQueue(true)
+    setTempBookingId(null)
+    setShowCashQRDialog(true)
+
+    setTimeout(() => setIsScanningLocked(false), 300)
+  }
+
+  const occupiedCount = manualOccupied
+  const acceptedBookingsCount = bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0)
+  const freeCount = 6 - occupiedCount - acceptedBookingsCount
+  const pendingBookingsCount = bookings.filter((b) => !b.accepted).reduce((sum, b) => sum + (b.count || 1), 0)
+
+  const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
+  const panelVisibility = getPanelVisibility(currentRaceState, {
+    currentStopIndex,
+    totalStops: stops.length,
+    freeSeats: freeCount,
+    occupiedSeats: occupiedCount,
+    hasActiveReservations: bookings.some((b) => b.fromStopIndex === currentStopIndex && !b.scanned),
+    queueSize: queuePassengers.length,
+    tripId,
+    isLastStop: currentStopIndex >= stops.length - 1,
+  })
+
+  const getRouteDisplayName = () => {
+    if (!selectedTrip) return t.selectTrip
+    const route = tripRoutes[selectedTrip as keyof typeof tripRoutes]
+    if (isDirectionReversed) {
+      return `${route.end} → ${route.start}`
+    }
+    return `${route.start} → ${route.end}`
+  }
+
+  const renderPassengerIcons = (count: number) => {
+    const iconCount = Math.min(count, 3)
+    return Array(iconCount)
+      .fill(0)
+      .map((_, i) => <User key={i} className="h-4 w-4" />)
+  }
+
+  const isPanelsDisabled = userStatus !== "confirmed" || areSeatsLocked
+
+  const canStartTrip = selectedTrip !== "" && tripStatus === STATE.PREP_IDLE && userStatus === "confirmed"
+
+  // ============================================================================
+  // РЕНДЕРИНГ - ЭКРАНЫ АВТОРИЗАЦИИ
+  // ============================================================================
+
+  if (!isAuthenticated) {
+    if (showRegister) {
+      return (
+        <RegisterForm
+          onRegister={() => {
+            setUserStatus("pending")
+            setShowRegister(false)
+            setIsAuthenticated(true)
+            localStorage.setItem("driverAuthenticated", "true")
+            localStorage.setItem("userStatus", "pending")
+          }}
+          onBackToLogin={() => setShowRegister(false)}
+          language={language}
+        />
+      )
+    }
+
     return (
-      <LoginForm 
-        onLogin={handleLogin} 
-        onRegister={() => setAuthState("register")}
+      <LoginForm
+        onLogin={() => {
+          setIsAuthenticated(true)
+          localStorage.setItem("driverAuthenticated", "true")
+          setUserStatus("confirmed")
+          localStorage.setItem("userStatus", "confirmed")
+        }}
+        onRegister={() => setShowRegister(true)}
         language={language}
-        onLanguageChange={setLanguage}
+        onLanguageChange={handleLanguageChange}
       />
     )
   }
 
-  // Register screen
-  if (authState === "register") {
+  if (isAuthenticated && userStatus !== "confirmed") {
     return (
-      <RegisterForm 
-        onRegister={handleRegister}
-        onBack={() => setAuthState("login")}
-        language={language}
-        onLanguageChange={setLanguage}
-      />
-    )
-  }
-
-  // Awaiting approval screen
-  if (authState === "awaiting") {
-    return (
-      <div className="min-h-screen bg-background flex items-center justify-center p-4">
-        <Card className="w-full max-w-md p-6 text-center">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-yellow-100 dark:bg-yellow-900/30 mb-4 mx-auto">
-            <Clock className="h-8 w-8 text-yellow-600 dark:text-yellow-400" />
-          </div>
-          <h1 className="text-xl font-bold mb-4">{t.awaitingApproval}</h1>
-          <Button 
-            onClick={() => setAuthState("dashboard")} 
-            className="w-full mb-2"
-          >
-            {t.refreshStatus}
-          </Button>
-          <Button 
-            variant="outline" 
-            onClick={() => setAuthState("login")} 
-            className="w-full"
-          >
-            {t.logout}
-          </Button>
-        </Card>
+      <div className="min-h-screen bg-gray-50 p-4">
+        <div className="mx-auto max-w-md space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>{language === "ru" ? "Аккаунт не подтвержден" : "Account Not Confirmed"}</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <p className="text-sm text-muted-foreground">
+                {language === "ru"
+                  ? "Ваш аккаунт ожидает подтверждения администратором. Пожалуйста, попробуйте позже."
+                  : "Your account is awaiting admin confirmation. Please try again later."}
+              </p>
+              <Button
+                onClick={() => {
+                  toast({
+                    title: language === "ru" ? "Обновлено" : "Refreshed",
+                    description: language === "ru" ? "Статус аккаунта обновлен" : "Account status refreshed",
+                  })
+                }}
+                className="w-full"
+              >
+                {language === "ru" ? "Обновить статус" : "Refresh Status"}
+              </Button>
+              <Button
+                onClick={() => {
+                  setIsAuthenticated(false)
+                  localStorage.removeItem("driverAuthenticated")
+                  localStorage.removeItem("userStatus")
+                }}
+                variant="outline"
+                className="w-full"
+              >
+                {language === "ru" ? "Выйти" : "Logout"}
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
       </div>
     )
   }
 
-  // Main Dashboard
+  // ============================================================================
+  // РЕНДЕРИНГ - ГЛАВНЫЙ ЭКРАН
+  // ============================================================================
+
   return (
-    <div className="min-h-screen bg-background">
-      {/* Header */}
-      <header className="sticky top-0 z-50 bg-background border-b px-4 py-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <MapPin className="h-5 w-5 text-primary" />
-            <span className="font-semibold">{t.tripNumber}247</span>
-          </div>
-          
-          <div className="flex items-center gap-2">
-            <GeoTrackerIndicator language={language} />
-            
-            <Select value={language} onValueChange={(value) => setLanguage(value as Language)}>
-              <SelectTrigger className="w-[80px] h-8">
-                <SelectValue>
-                  <div className="flex items-center gap-1">
-                    <Languages className="h-3 w-3" />
-                    <span className="text-xs">{languageOptions.find(l => l.code === language)?.flag}</span>
-                  </div>
+    <div className="min-h-screen bg-gray-50 p-2 sm:p-4">
+      <div className="bg-card border-b border-border px-4 py-4 sticky top-0 z-10 shadow-sm rounded-lg mb-4">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2 flex-1">
+            <Select 
+              value={selectedTrip} 
+              onValueChange={handleSelectRoute} 
+              disabled={userStatus !== "confirmed" || isRouteDropdownDisabled}
+            >
+              <SelectTrigger
+                className={`${isRouteDropdownDisabled || (selectedTrip && tripStatus === STATE.PREP_IDLE) ? "w-auto min-w-40 max-w-full" : "w-auto min-w-48 max-w-full"} h-auto min-h-10 ${
+                  isRouteDropdownDisabled ? "opacity-50 cursor-not-allowed" : ""
+                }`}
+              >
+                <SelectValue placeholder={t.selectTrip}>
+                  <span className="whitespace-normal leading-tight break-words">
+                    {selectedTrip && getRouteDisplayName()}
+                  </span>
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
-                {languageOptions.map((lang) => (
-                  <SelectItem key={lang.code} value={lang.code}>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium">{lang.flag}</span>
-                      <span>{lang.name}</span>
-                    </div>
-                  </SelectItem>
-                ))}
+                <SelectItem value="247">
+                  {tripRoutes["247"].start} → {tripRoutes["247"].end}
+                </SelectItem>
+                <SelectItem value="248">
+                  {tripRoutes["248"].start} → {tripRoutes["248"].end}
+                </SelectItem>
+                <SelectItem value="249">
+                  {tripRoutes["249"].start} → {tripRoutes["249"].end}
+                </SelectItem>
               </SelectContent>
             </Select>
-
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
-              <LogOut className="h-4 w-4" />
+            {tripStatus === STATE.PREP_IDLE && selectedTrip && (
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={handleToggleDirection}
+                disabled={!selectedTrip || userStatus !== "confirmed"}
+              >
+                <ArrowLeftRight className="h-4 w-4" />
+              </Button>
+            )}
+            {selectedTrip && (
+              <Badge variant="secondary" className="text-sm px-2 py-1 whitespace-nowrap">
+                {language === "ru" ? "Тариф:" : "Tariff:"}{" "}
+                {formatCurrency(tripRoutes[selectedTrip as keyof typeof tripRoutes].tariff)} ₽
+              </Badge>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant={tripStatus !== STATE.PREP_IDLE ? "default" : "secondary"} className="text-2xl px-3 py-1">
+              {getTripStatusEmoji()}
+            </Badge>
+            <Link href="/balance">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-9 w-9"
+                disabled={userStatus !== "confirmed"}
+                onClick={(e) => {
+                  if (userStatus !== "confirmed") {
+                    e.preventDefault()
+                    console.log("[v0] ui:blocked", { action: "navigateToBalance", reason: "accountUnconfirmed" })
+                    toast({
+                      title: t.error,
+                      description: language === "ru" ? "Аккаунт не подтвержден" : "Account not confirmed",
+                      variant: "destructive",
+                    })
+                  }
+                }}
+              >
+                <Wallet className="h-5 w-5" />
+              </Button>
+            </Link>
+            <Button variant="ghost" size="icon" onClick={handleLogout} className="h-9 w-9">
+              <LogOut className="h-5 w-5" />
             </Button>
           </div>
         </div>
-      </header>
 
-      <main className="p-4 space-y-4 pb-24">
-        {/* Balance Card */}
-        <Link href="/balance">
-          <Card className="p-4 hover:bg-accent/50 transition-colors cursor-pointer">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="p-2 rounded-full bg-primary/10">
-                  <Wallet className="h-5 w-5 text-primary" />
-                </div>
-                <div>
-                  <p className="text-sm text-muted-foreground">{t.driverBalance}</p>
-                  <p className="text-xl font-bold">{formatCurrency(balance)} RUB</p>
-                </div>
+        {tripId && (
+          <div className="mb-3">
+            <p className="text-xs text-muted-foreground">
+              {t.tripId}: {tripId}
+            </p>
+          </div>
+        )}
+
+        {userStatus === "pending" ? (
+          <Card className="p-6 border-2 border-yellow-500/50 bg-yellow-50/50 dark:bg-yellow-900/10">
+            <div className="flex items-start gap-4">
+              <div className="text-4xl">⏳</div>
+              <div className="flex-1 space-y-3">
+                <h3 className="font-semibold text-lg">
+                  {language === "ru"
+                    ? "Ожидание подтверждения администратора"
+                    : language === "fr"
+                      ? "En attente de confirmation de l'administrateur"
+                      : language === "ar"
+                        ? "في انتظار تأكيد المسؤول"
+                        : "Awaiting Admin Confirmation"}
+                </h3>
+                <p className="text-sm text-muted-foreground">
+                  {language === "ru"
+                    ? "Вы зарегистрированы, ждите подтверждения ваших данных администратором. Обычно это занимает 1 рабочий день."
+                    : language === "fr"
+                      ? "Vous êtes enregistré, veuillez attendre la confirmation de vos données par l'administrateur. Cela prend généralement 1 jour ouvrable."
+                      : language === "ar"
+                        ? "أنت مسجل، يرجى انتظار تأكيد بياناتك من قبل المسؤول. عادة ما يستغرق ذلك يوم عمل واحد."
+                        : "You are registered, please wait for confirmation of your data by the administrator. This usually takes 1 business day."}
+                </p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    toast({
+                      title: language === "ru" ? "Статус проверен" : "Status checked",
+                      description: language === "ru" ? "Ожидание подтверждения" : "Awaiting confirmation",
+                    })
+                  }}
+                >
+                  🔄 {language === "ru" ? "Обновить статус" : "Refresh Status"}
+                </Button>
               </div>
-              <ChevronRight className="h-5 w-5 text-muted-foreground" />
             </div>
           </Card>
-        </Link>
+        ) : (
+          <>
+            {userStatus === "confirmed" && (
+              <>
+                {tripStatus === STATE.FINISHED && (
+                  <div className="flex items-center gap-2 w-full">
+                    <Button
+                      onClick={() => {
+                        if (userStatus !== "confirmed") {
+                          console.log("[v0] ui:blocked", { action: "finishTrip", reason: "accountUnconfirmed" })
+                          toast({
+                            title: t.error,
+                            description: language === "ru" ? "Аккаунт не подтвержден" : "Account not confirmed",
+                            variant: "destructive",
+                          })
+                          return
+                        }
+                        clickFinish()
+                      }}
+                      className="flex-1"
+                      size="lg"
+                    >
+                      {t.finishTrip}
+                    </Button>
 
-        {/* Trip FSM Button */}
-        <TripFSMButton 
-          currentState={tripState}
-          onStateChange={handleTripStateChange}
-          language={language}
-          t={t}
-        />
+                    <GeoTrackerIndicator isActive={isGeoTrackerActive} language={language} />
+                  </div>
+                )}
+                {tripStatus !== "FINISHED" && (
+                  <div className="flex items-center gap-2 w-full">
+                    <Button
+                      onClick={() => {
+                        if (userStatus !== "confirmed") {
+                          console.log("[v0] ui:blocked", { action: "tripStatusButton", reason: "accountUnconfirmed" })
+                          toast({
+                            title: t.error,
+                            description: language === "ru" ? "Аккаунт не подтвержден" : "Account not confirmed",
+                            variant: "destructive",
+                          })
+                          return
+                        }
+                        handleTripButton()
+                      }}
+                      disabled={tripStatus === STATE.PREP_IDLE && !canStartTrip}
+                      className="flex-1"
+                      size="lg"
+                    >
+                      {getTripButtonText()}
+                    </Button>
 
-        {/* Queue Section - Only visible during boarding or preparation */}
-        {(tripState === "preparation" || tripState === "boarding") && (
-          <Card className="p-4">
-            <div className="flex items-center gap-2 mb-4">
-              <Users className="h-5 w-5 text-primary" />
-              <h2 className="font-semibold">{t.queue}</h2>
-              <span className="text-sm text-muted-foreground">
-                ({passengers.filter(p => !p.scanned || p.qrError).length})
-              </span>
+                    {tripStatus === STATE.PREP_IDLE && selectedTrip && (
+                      <Button
+                        variant="outline"
+                        size="lg"
+                        onClick={handleToggleDirection}
+                        disabled={!selectedTrip || userStatus !== "confirmed"}
+                        className="px-4 bg-transparent"
+                      >
+                        <ArrowLeftRight className="h-5 w-5" />
+                      </Button>
+                    )}
+
+                    {tripStatus === STATE.PREP_TIMER && (
+                      <Button
+                        variant="outline"
+                        size="lg"
+                        onClick={clickCancelPrep}
+                        className="whitespace-nowrap bg-transparent"
+                      >
+                        {language === "ru" ? "Отмена" : "Cancel"}
+                      </Button>
+                    )}
+
+                    {(tripStatus === STATE.BOARDING ||
+                      tripStatus === STATE.ROUTE_READY ||
+                      tripStatus === STATE.IN_ROUTE) && (
+                      <div className="flex flex-col items-end gap-1">
+                        {tripStatus === STATE.ROUTE_READY && currentStopIndex > 0 && (
+                          <span className="text-xs text-muted-foreground font-medium">
+                            {stops[currentStopIndex]?.name}
+                          </span>
+                        )}
+                        <GeoTrackerIndicator isActive={isGeoTrackerActive} language={language} />
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="px-2 pt-4 space-y-6">
+        {selectedTrip && panelVisibility.cash !== "hidden" && !isPanelsDisabled && (
+          <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
+            <h2 className="text-lg font-bold text-foreground mb-4">{t.seats}</h2>
+            <div className="grid grid-cols-4 gap-3">
+              <div className="text-center p-4 rounded-lg bg-secondary">
+                <div className="flex items-center justify-center gap-1 mb-2">
+                  <Button
+                    size="icon"
+                    variant="outline"
+                    className="h-6 w-6 bg-transparent flex-shrink-0"
+                    onClick={() => setManualOccupied(Math.max(0, manualOccupied - 1))}
+                    disabled={manualOccupied === 0 || isPanelsDisabled}
+                  >
+                    <Minus className="h-3 w-3" />
+                  </Button>
+                  <div className="text-2xl font-bold text-primary min-w-[2rem]">{occupiedCount}</div>
+                  <Button
+                    size="icon"
+                    variant="outline"
+                    className="h-6 w-6 bg-transparent flex-shrink-0"
+                    onClick={() => setManualOccupied(Math.min(6, manualOccupied + 1))}
+                    disabled={manualOccupied === 6 || isPanelsDisabled}
+                  >
+                    <Plus className="h-3 w-3" />
+                  </Button>
+                </div>
+                <div className="text-xs text-muted-foreground">{t.occupied}</div>
+              </div>
+              <div className="text-center p-4 rounded-lg bg-secondary">
+                <div className="text-2xl font-bold text-blue-600">
+                  {acceptedBookingsCount}:{pendingBookingsCount}
+                </div>
+                <div className="text-xs text-muted-foreground mt-1">{t.bookingsShort}</div>
+              </div>
+              <div className="text-center p-4 rounded-lg bg-secondary">
+                <div className="text-2xl font-bold text-accent">{freeCount}</div>
+                <div className="text-xs text-muted-foreground mt-1">{t.free}</div>
+              </div>
+              <div className="text-center p-4 rounded-lg bg-secondary">
+                <div className="text-2xl font-bold text-foreground">6</div>
+                <div className="text-xs text-muted-foreground mt-1">{t.total}</div>
+              </div>
+            </div>
+          </Card>
+        )}
+
+        {panelVisibility.queue !== "hidden" && selectedTrip && 6 - manualOccupied - acceptedBookingsCount > 0 && !isPanelsDisabled && (
+          <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <Users className="h-5 w-5 text-primary" />
+                <h2 className="text-lg font-bold text-foreground">{t.queue}</h2>
+              </div>
+              <Badge variant="secondary" className="text-lg px-3 py-1">
+                {queuePassengers.length}
+              </Badge>
             </div>
 
             <QueueQRScanner
-              passengers={passengers}
-              onUpdate={setPassengers}
-              onAccept={handleAcceptPassenger}
-              onReject={handleRejectPassenger}
-              onReturn={handleReturnPassenger}
-              disabled={tripState === "idle"}
+              passengers={queuePassengers}
+              onUpdate={setQueuePassengers}
+              onAccept={handleAcceptQueuePassenger}
+              onReject={handleRejectQueuePassenger}
+              onReturn={handleReturnQueuePassenger}
+              disabled={isPanelsDisabled}
               language={language}
               t={t}
             />
           </Card>
         )}
 
-        {/* Route Stops */}
-        <Card className="p-4">
-          <h2 className="font-semibold mb-3">{t.routeStops}</h2>
+        {selectedTrip && bookings.length > 0 && tripStatus === STATE.BOARDING && currentStopIndex < stops.length - 1 && (
+          <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-bold text-foreground">{t.stops}</h2>
+              {currentStopIndex > 1 && visitedStops.size > 1 && (
+                <Button variant="ghost" size="sm" onClick={() => setShowStopHistory(!showStopHistory)}>
+                  {showStopHistory
+                    ? language === "ru"
+                      ? "Скрыть историю"
+                      : "Hide history"
+                    : language === "ru"
+                      ? "Показать историю"
+                      : "Show history"}
+                </Button>
+              )}
+            </div>
+            <div className="space-y-1">
+              {stops
+                .slice(showStopHistory ? 0 : currentStopIndex, -1)
+                .map((stop, index, array) => {
+                  const stopBookings = bookings.filter((b) => b.fromStopIndex === stop.id)
+
+                  const historyBoarded = stopBookings
+                    .filter((b) => b.scanned)
+                    .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+                  const historyReserved = stopBookings
+                    .filter((b) => !b.scanned)
+                    .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+                  const visibleBookings = stopBookings.filter((b) => {
+                    return !b.scanned && (b.reserved || freeCount >= (b.count || 1))
+                  })
+
+                  const isPastStop = visitedStops.has(stop.id) && stop.id < currentStopIndex
+
+                  if (stop.id === 0 && stopBookings.length === 0) {
+                    return null
+                  }
+
+                  if (stop.id === stops[stops.length - 1].id) {
+                    return null
+                  }
+
+                  if (!isPastStop && stopBookings.length === 0) {
+                    return null
+                  }
+
+                  return (
+                    <div key={stop.id} className={isPastStop ? "opacity-50" : ""}>
+                      <div className="flex items-start gap-3 py-2">
+                        <div className="flex-shrink-0 mt-1">
+                          <div className="flex items-center gap-1">
+                            {isPastStop && <span className="text-xs mr-1">✓</span>}
+                            <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span className="text-sm font-semibold text-muted-foreground">{stop.time}</span>
+                          </div>
+                        </div>
+                        <div className="flex-1">
+                          <div className="flex items-center justify-between mb-2">
+                            <div>
+                              <h3 className="font-semibold text-base text-foreground">{stop.name}</h3>
+
+                              {isPastStop && (
+                                <div className="text-xs text-muted-foreground mt-1 font-medium">
+                                  {(() => {
+                                    const history = stopHistoryMap.get(stop.id)
+                                    if (history) {
+                                      return language === "ru"
+                                        ? `Зарезервировано: ${history.reserved}, Посажено: ${history.boarded}`
+                                        : `Reserved: ${history.reserved}, Boarded: ${history.boarded}`
+                                    }
+                                    return language === "ru"
+                                      ? `Зарезервировано: ${historyReserved}, Посажено: ${historyBoarded}`
+                                      : `Reserved: ${historyReserved}, Boarded: ${historyBoarded}`
+                                  })()}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {visibleBookings.length > 0 && !isPastStop && (
+                            <div className="space-y-2 mt-3">
+                              {visibleBookings.map((booking) => (
+                                <div
+                                  key={booking.id}
+                                  className={`p-3 rounded-lg bg-secondary border ${
+                                    highlightedBookingId === booking.id
+                                      ? "border-green-500 ring-2 ring-green-500/50 bg-green-50 dark:bg-green-900/20"
+                                      : booking.qrError
+                                        ? "border-red-500"
+                                        : booking.reserved
+                                          ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20"
+                                          : "border-border"
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between mb-2">
+                                    <h4 className="font-semibold text-sm text-foreground flex items-center gap-2">
+                                      {booking.qrError && <X className="h-4 w-4 text-red-500" />}
+                                      {booking.reserved && <span className="text-xs">✓</span>}
+                                      {booking.passengerName}
+                                    </h4>
+                                    <span className="text-xs text-muted-foreground font-semibold">
+                                      {booking.count} {t.bookings}
+                                    </span>
+                                  </div>
+
+                                  {booking.qrError && (
+                                    <div className="space-y-2">
+                                      <div className="p-2 rounded bg-destructive/10 border border-destructive/20">
+                                        <p className="text-xs text-destructive">{booking.qrError}</p>
+                                      </div>
+                                      <div className="flex gap-2">
+                                        <Button
+                                          onClick={() => handleRejectQRNotFoundBooking(booking.id)}
+                                          className="flex-1 h-9 text-sm font-semibold"
+                                          variant="destructive"
+                                          size="sm"
+                                          disabled={isPanelsDisabled}
+                                        >
+                                          {t.reject}
+                                        </Button>
+                                        <Button
+                                          onClick={() => handleReturnBooking(booking.id)}
+                                          className="h-9 w-9"
+                                          variant="outline"
+                                          size="icon"
+                                          title={language === "ru" ? "Вернуть" : "Return"}
+                                          disabled={isPanelsDisabled}
+                                        >
+                                          <Undo2 className="h-4 w-4" />
+                                        </Button>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {!booking.qrError && booking.showQRButtons && booking.qrData && (
+                                    <div>
+                                      <div className="flex gap-2">
+                                        <Button
+                                          onClick={() => handleAcceptBookingQR(booking.id)}
+                                          className="flex-1 h-9 text-sm font-semibold"
+                                          variant="default"
+                                          size="sm"
+                                          disabled={isPanelsDisabled}
+                                        >
+                                          {t.accept}
+                                        </Button>
+                                        <Button
+                                          onClick={() => handleRejectBookingQR(booking.id)}
+                                          className="flex-1 h-9 text-sm font-semibold"
+                                          variant="destructive"
+                                          size="sm"
+                                          disabled={isPanelsDisabled}
+                                        >
+                                          {t.reject}
+                                        </Button>
+                                        <Button
+                                          onClick={() => handleReturnBooking(booking.id)}
+                                          className="h-9 w-9"
+                                          variant="outline"
+                                          size="icon"
+                                          title={language === "ru" ? "Вернуть" : "Return"}
+                                          disabled={isPanelsDisabled}
+                                        >
+                                          <Undo2 className="h-4 w-4" />
+                                        </Button>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {!booking.qrError && !booking.showQRButtons && !booking.reserved && (
+                                    <div className="flex gap-2">
+                                      <Button
+                                        onClick={() => handleReserveBooking(booking.id)}
+                                        className="flex-1 h-9 text-sm font-semibold"
+                                        variant="default"
+                                        size="sm"
+                                        disabled={isPanelsDisabled}
+                                      >
+                                        {language === "ru" ? "Взять" : "Reserve"}
+                                      </Button>
+                                      <Button
+                                        onClick={() => handleCancelBooking(booking.id, stop.id === currentStopIndex)}
+                                        className="h-9 w-auto px-3 text-sm font-semibold"
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={isPanelsDisabled}
+                                        style={{ backgroundColor: "#fbbf24", borderColor: "#fbbf24" }}
+                                      >
+                                        {language === "ru" ? "Отменить" : "Cancel"}
+                                      </Button>
+                                    </div>
+                                  )}
+
+                                  {!booking.qrError && !booking.showQRButtons && booking.reserved && (
+                                    <div className="flex gap-2">
+                                      <Button
+                                        onClick={() => handleAcceptBooking(booking.id)}
+                                        className="flex-1 h-9 text-sm font-semibold"
+                                        variant="default"
+                                        size="sm"
+                                        disabled={isPanelsDisabled || stop.id !== currentStopIndex}
+                                      >
+                                        <QrCode className="mr-2 h-4 w-4" />
+                                        {t.scanQR}
+                                      </Button>
+                                      <Button
+                                        onClick={() => handleCancelBooking(booking.id, stop.id === currentStopIndex)}
+                                        className="h-9 w-auto px-3 text-sm font-semibold"
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={isPanelsDisabled}
+                                        style={{ backgroundColor: "#fbbf24", borderColor: "#fbbf24" }}
+                                      >
+                                        {language === "ru" ? "Отменить" : "Cancel"}
+                                      </Button>
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {stopVoting[stop.id] && stopVoting[stop.id].length > 0 && !isPastStop && (
+                            <div className="mt-3 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200">
+                              <div className="flex items-center justify-between mb-2">
+                                <div className="flex items-center gap-2">
+                                  <User className="h-4 w-4 text-amber-600" />
+                                  <span className="text-sm font-semibold text-amber-900 dark:text-amber-100">
+                                    {language === "ru" ? "Голосуют:" : "Voting:"} {stopVoting[stop.id].length} (
+                                    {stopVoting[stop.id].reduce((sum, v) => sum + (v.passengerCount || 1), 0)})
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {stopVoting[stop.id].map((voter) => (
+                                  <div
+                                    key={voter.id}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-amber-100 dark:bg-amber-800 border border-amber-300 dark:border-amber-700"
+                                  >
+                                    <Clock className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+                                    <span className="text-sm font-mono font-semibold text-amber-900 dark:text-amber-100">
+                                      0:{String(voter.timeLeft).padStart(2, "0")} ({voter.passengerCount || 1})
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {visibleBookings.length === 0 && !isPastStop && stopBookings.length > 0 && (
+                            <div className="text-xs text-muted-foreground italic mt-2">
+                              {language === "ru"
+                                ? "Нет свободных мест для новых броней"
+                                : "No free seats for new bookings"}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {index < array.length - 1 && (
+                        <div className="ml-2">
+                          <div className="w-px h-8 bg-border" />
+                        </div>
+                      )}
+                    </div>
+                  )
+                })
+                .filter(Boolean)}
+            </div>
+          </Card>
+        )}
+      </div>
+
+      <CashQRDialog
+        open={showCashQRDialog}
+        onOpenChange={(isOpen) => {
+          setShowCashQRDialog(isOpen)
+          if (!isOpen) {
+            setIsScanningLocked(false)
+            setScanningForQueue(false)
+            setCurrentQueueScanId(null)
+            setTempBookingId(null)
+            setQrScannedData(null)
+            scanInProgressRef.current = false
+            
+            // Сброс FSM оплаты при закрытии
+            if (paymentFSM.state !== "idle") {
+              setPaymentFSM({
+                state: "idle",
+                context: {
+                  paymentType: "cash",
+                  amount: 0,
+                }
+              })
+            }
+          }
+        }}
+        driverName={language === "ru" ? "Водитель Иванов И.И." : "Driver Ivanov I."}
+        amount={320}
+        currency="RUB"
+        onConfirm={handleConfirmQR}
+        onInvalid={handleInvalidQR}
+        language={language}
+        showNotFoundButton={true}
+        onQRNotFound={handleQRNotFoundForBooking}
+        onQueuePassengerScan={handleQueuePassengerScan}
+      />
+
+      <Dialog open={showCancelDialog} onOpenChange={setShowCancelDialog}>
+        <DialogContent onPointerDownOutside={(e) => e.preventDefault()} onEscapeKeyDown={(e) => e.preventDefault()}>
+          <DialogHeader>
+            <DialogTitle>{language === "ru" ? "Причина отмены" : "Cancellation reason"}</DialogTitle>
+          </DialogHeader>
           <div className="space-y-3">
-            {[
-              { name: t.centerStart, bookings: 3, time: "08:00" },
-              { name: t.leninStreet, bookings: 2, time: "08:15" },
-              { name: t.galleryMall, bookings: 1, time: "08:30" },
-              { name: t.stationEnd, bookings: 0, time: "08:45" },
-            ].map((stop, index) => (
-              <div 
-                key={index}
-                className="flex items-center justify-between p-3 rounded-lg bg-secondary/50"
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-2 h-2 rounded-full bg-primary" />
-                  <div>
-                    <p className="font-medium">{stop.name}</p>
-                    <p className="text-xs text-muted-foreground">{stop.time}</p>
-                  </div>
-                </div>
-                {stop.bookings > 0 && (
-                  <span className="text-sm font-medium text-primary">
-                    {stop.bookings} {t.bookings}
-                  </span>
-                )}
-              </div>
-            ))}
+            {(() => {
+              const booking = bookings.find((b) => b.id === cancelBookingId)
+              const isBoardingStop = booking?.cancelContext === "boarding"
+
+              const boardingReasons = [
+                { value: "not_found", label: language === "ru" ? "Не найден на остановке" : "Not found at stop" },
+                { value: "accident", label: language === "ru" ? "Авария" : "Accident" },
+                { value: "conflict", label: language === "ru" ? "Конфликтная ситуация" : "Conflict situation" },
+                { value: "other", label: language === "ru" ? "Иное" : "Other" },
+              ]
+
+              const futureStopReasons = [
+                { value: "big_queue", label: language === "ru" ? "Большая очередь" : "Big queue" },
+                { value: "group_full", label: language === "ru" ? "Группа на все места" : "Group for all seats" },
+                { value: "other", label: language === "ru" ? "Иное" : "Other" },
+              ]
+
+              const reasons = isBoardingStop ? boardingReasons : futureStopReasons
+
+              return reasons.map((reason) => (
+                <Button
+                  key={reason.value}
+                  onClick={() => setCancelReason(reason.label)}
+                  variant={cancelReason === reason.label ? "default" : "outline"}
+                  className="w-full justify-start"
+                >
+                  {reason.label}
+                </Button>
+              ))
+            })()}
           </div>
-        </Card>
-      </main>
+          <div className="flex gap-2 pt-4">
+            <Button onClick={confirmCancelBooking} disabled={!cancelReason} className="flex-1">
+              {language === "ru" ? "OK" : "OK"}
+            </Button>
+            <Button
+              onClick={() => {
+                setShowCancelDialog(false)
+                setCancelBookingId(null)
+                setCancelReason("")
+              }}
+              variant="outline"
+              className="flex-1"
+            >
+              {language === "ru" ? "Отмена" : "Cancel"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
