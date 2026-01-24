@@ -15,6 +15,7 @@ import { formatCurrency, formatDateTime, generateTripId } from "@/lib/utils"
 import { GeoTrackerIndicator } from "@/components/geo-tracker-indicator"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { QueueQRScanner } from "@/components/queue-qr-scanner"
+import type { QueuePassenger } from "@/components/queue-qr-scanner"
 import { CashQRDialog } from "@/components/cash-qr-dialog"
 import {
   TRIP_STATUS_TO_RACE_STATE,
@@ -22,7 +23,15 @@ import {
   createRaceContext,
   validateTransition,
   getPanelVisibility,
-  getButtonConfig,  // ← ДОБАВЛЕНО
+  getButtonConfig,
+  QueuePassengerState,
+  PaymentState,
+  PaymentContext,
+  PaymentAction,
+  PreRaceState,
+  PreRaceContext,
+  PreRaceAction,
+  PRE_RACE_FSM_TRANSITIONS,
 } from "@/lib/fsm-types"
 
 const STATE = {
@@ -66,7 +75,7 @@ interface Booking {
     created_at: string
   }
   passengerCount?: number
-  cancelContext?: "boarding" | "future_stop" // ДОБАВЛЕНО
+  cancelContext?: "boarding" | "future_stop"
 }
 
 interface RouteStop {
@@ -75,49 +84,34 @@ interface RouteStop {
   time: string
 }
 
-interface QueuePassenger {
-  id: number
-  name: string
-  queuePosition: number
-  isFirst: boolean
-  scanned?: boolean
-  count: number
-  qrError?: boolean
-  showQRButtons?: boolean
-  qrData?: {
-    sum: number
-    recipient: string
-    created_at: string
-  }
-  ticketCount: number
-  orderNumber: number
-}
-
 interface StopHistory {
   stopId: number
   reserved: number
   boarded: number
 }
+
 interface VotingPassenger {
   id: number
-  timeLeft: number // секунды
-  passengerCount?: number // ДОБАВЛЕНО: количество человек в группе
+  timeLeft: number
+  passengerCount?: number
 }
 
 interface StopVoting {
   [stopId: number]: VotingPassenger[]
 }
+
 interface RouteData {
   start: string
   end: string
-  tariff: number // тариф за поездку
+  tariff: number
   stops: RouteStop[]
 }
+
 const tripRoutes: Record<string, RouteData> = {
   "247": {
     start: "Центр",
     end: "Вокзал",
-    tariff: 350, // ДОБАВЛЕНО: тариф в рублях
+    tariff: 350,
     stops: [
       { id: 0, name: "Центр", time: "14:00" },
       { id: 1, name: "пл. Ленина", time: "14:15" },
@@ -128,7 +122,7 @@ const tripRoutes: Record<string, RouteData> = {
   "248": {
     start: "Аэропорт",
     end: "Университет",
-    tariff: 420, // ДОБАВЛЕНО
+    tariff: 420,
     stops: [
       { id: 0, name: "Аэропорт", time: "10:00" },
       { id: 1, name: "пл. Революции", time: "10:20" },
@@ -139,7 +133,7 @@ const tripRoutes: Record<string, RouteData> = {
   "249": {
     start: "Рынок",
     end: "Больница",
-    tariff: 300, // ДОБАВЛЕНО
+    tariff: 300,
     stops: [
       { id: 0, name: "Рынок", time: "08:00" },
       { id: 1, name: "ул. Мира", time: "08:20" },
@@ -152,23 +146,31 @@ const tripRoutes: Record<string, RouteData> = {
 export default function DriverDashboard() {
   console.log("[v0] DriverDashboard initializing")
 
+  // ============================================================================
+  // FSM ПРЕДРЕЙСОВОГО ЭКРАНА
+  // ============================================================================
+  const [preRaceState, setPreRaceState] = useState<PreRaceState | null>("route_selection")
+  
+  // ============================================================================
+  // ОСНОВНЫЕ СОСТОЯНИЯ
+  // ============================================================================
   const [currentStopIndex, setCurrentStopIndex] = useState<number>(0)
   const [visitedStops, setVisitedStops] = useState(new Set() as Set<number>)
 
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [showRegister, setShowRegister] = useState(false)
-  const [userStatus, setUserStatus] = useState<"pending" | "approved" | "confirmed">("pending") // Changed to include confirmed
+  const [userStatus, setUserStatus] = useState<"pending" | "approved" | "confirmed">("pending")
   const [language, setLanguage] = useState<Language>("ru")
   const t = translations[language]
   const { toast } = useToast()
 
   const [activeTab, setActiveTab] = useState<string>("dashboard")
   const [deposit, setDeposit] = useState<number>(0)
-  const [commission, setCommission] = useState<number>(0) // Added commission state
+  const [commission, setCommission] = useState<number>(0)
 
   const [tripStatus, setTripStatus] = useState<TripStatus>(STATE.PREP_IDLE)
   const [tripId, setTripId] = useState<string>("")
-  const [selectedTrip, setSelectedTrip] = useState("247")
+  const [selectedTrip, setSelectedTrip] = useState("")
   const [isDirectionReversed, setIsDirectionReversed] = useState(false)
   const [isRouteDropdownDisabled, setIsRouteDropdownDisabled] = useState(false)
 
@@ -185,7 +187,7 @@ export default function DriverDashboard() {
   } | null>(null)
   const [stopHistoryMap, setStopHistoryMap] = useState(new Map() as Map<number, StopHistory>)
 
-  const [stops, setStops] = useState<RouteStop[]>(tripRoutes["247"].stops)
+  const [stops, setStops] = useState<RouteStop[]>([])
 
   const [seats, setSeats] = useState<Seat[]>([
     {
@@ -230,7 +232,7 @@ export default function DriverDashboard() {
       toStopIndex: 3,
       amount: 320,
       count: 1,
-      passengerCount: 1, // Added
+      passengerCount: 1,
     },
     {
       id: 2,
@@ -241,7 +243,7 @@ export default function DriverDashboard() {
       toStopIndex: 3,
       amount: 320,
       count: 2,
-      passengerCount: 1, // Added
+      passengerCount: 1,
     },
     {
       id: 3,
@@ -252,37 +254,98 @@ export default function DriverDashboard() {
       toStopIndex: 3,
       amount: 180,
       count: 1,
-      passengerCount: 1, // Added
+      passengerCount: 1,
     },
   ])
 
+  // ============================================================================
+  // FSM ОЧЕРЕДИ - С НОВЫМИ СОСТОЯНИЯМИ
+  // ============================================================================
   const [queuePassengers, setQueuePassengers] = useState<QueuePassenger[]>([
-    { id: 1, name: "Петр С.", queuePosition: 1, isFirst: true, count: 1, ticketCount: 1, orderNumber: 1 },
-    { id: 2, name: "Анна М.", queuePosition: 2, isFirst: false, count: 2, ticketCount: 2, orderNumber: 2 },
-    { id: 3, name: "Игорь Л.", queuePosition: 3, isFirst: false, count: 1, ticketCount: 1, orderNumber: 3 },
-    { id: 4, name: "Ольга К.", queuePosition: 4, isFirst: false, count: 3, ticketCount: 3, orderNumber: 4 },
-    { id: 5, name: "Сергей Д.", queuePosition: 5, isFirst: false, count: 1, ticketCount: 1, orderNumber: 5 },
+    { 
+      id: 1, 
+      name: "Петр С.", 
+      queuePosition: 1, 
+      isFirst: true, 
+      count: 1, 
+      ticketCount: 1, 
+      orderNumber: 1,
+      fsmState: "waiting"
+    },
+    { 
+      id: 2, 
+      name: "Анна М.", 
+      queuePosition: 2, 
+      isFirst: false, 
+      count: 2, 
+      ticketCount: 2, 
+      orderNumber: 2,
+      fsmState: "waiting"
+    },
+    { 
+      id: 3, 
+      name: "Игорь Л.", 
+      queuePosition: 3, 
+      isFirst: false, 
+      count: 1, 
+      ticketCount: 1, 
+      orderNumber: 3,
+      fsmState: "waiting"
+    },
+    { 
+      id: 4, 
+      name: "Ольга К.", 
+      queuePosition: 4, 
+      isFirst: false, 
+      count: 3, 
+      ticketCount: 3, 
+      orderNumber: 4,
+      fsmState: "waiting"
+    },
+    { 
+      id: 5, 
+      name: "Сергей Д.", 
+      queuePosition: 5, 
+      isFirst: false, 
+      count: 1, 
+      ticketCount: 1, 
+      orderNumber: 5,
+      fsmState: "waiting"
+    },
   ])
+
+  // ============================================================================
+  // FSM ОПЛАТЫ - НОВОЕ СОСТОЯНИЕ
+  // ============================================================================
+  const [paymentFSM, setPaymentFSM] = useState<{
+    state: PaymentState
+    context: PaymentContext
+  }>({
+    state: "idle",
+    context: {
+      paymentType: "cash",
+      amount: 0,
+    }
+  })
 
   const [manualOccupied, setManualOccupied] = useState(0)
   const [tempBookingId, setTempBookingId] = useState<number | null>(null)
   const [scanningForQueue, setScanningForQueue] = useState(false)
   const [highlightedBookingId, setHighlightedBookingId] = useState<number | null>(null)
   const [currentQueueScanId, setCurrentQueueScanId] = useState<number | null>(null)
-  const [highlightedPassengerId, setHighlightedPassengerId] = useState<number | null>(null) // Added for queue passengers
+  const [highlightedPassengerId, setHighlightedPassengerId] = useState<number | null>(null)
   const [showCancelDialog, setShowCancelDialog] = useState(false)
   const [cancelBookingId, setCancelBookingId] = useState<number | null>(null)
   const [cancelReason, setCancelReason] = useState<string>("")
   const [isScanningLocked, setIsScanningLocked] = useState(false)
-  const [areSeatsLocked, setAreSeatsLocked] = useState(true) // Seats start locked
+  const [areSeatsLocked, setAreSeatsLocked] = useState(true)
   const [isGeoTrackerActive, setIsGeoTrackerActive] = useState(false)
   const [showStopHistory, setShowStopHistory] = useState(false)
   const scanInProgressRef = useRef(false)
 
-  // ADDED: isDepositAdded state and corresponding setter
-  const [isDepositAdded, setIsDepositAdded] = useState(false) // Initialize as false
-
+  const [isDepositAdded, setIsDepositAdded] = useState(false)
   const [isStateLoaded, setIsStateLoaded] = useState(false)
+  
   const [stopVoting, setStopVoting] = useState<StopVoting>({
     1: [
       { id: 1, timeLeft: 60, passengerCount: 2 },
@@ -290,6 +353,11 @@ export default function DriverDashboard() {
     ],
     2: [{ id: 1, timeLeft: 60, passengerCount: 1 }],
   })
+
+  // ============================================================================
+  // ЭФФЕКТЫ
+  // ============================================================================
+  
   useEffect(() => {
     const interval = setInterval(() => {
       setStopVoting((prev) => {
@@ -325,7 +393,6 @@ export default function DriverDashboard() {
       try {
         const parsedState = JSON.parse(savedAppState)
 
-        // Восстанавливаем состояния
         if (parsedState.tripStatus) setTripStatus(parsedState.tripStatus)
         if (parsedState.tripId) setTripId(parsedState.tripId)
         if (parsedState.selectedTrip) setSelectedTrip(parsedState.selectedTrip)
@@ -339,15 +406,17 @@ export default function DriverDashboard() {
         if (parsedState.hasOwnProperty("commission")) setCommission(parsedState.commission)
         if (parsedState.hasOwnProperty("isDepositAdded")) setIsDepositAdded(parsedState.isDepositAdded)
         if (parsedState.activeTab) setActiveTab(parsedState.activeTab)
+        
+        // FSM состояния
+        if (parsedState.preRaceState) setPreRaceState(parsedState.preRaceState)
+        if (parsedState.paymentFSM) setPaymentFSM(parsedState.paymentFSM)
 
         if (parsedState.visitedStops) setVisitedStops(new Set(parsedState.visitedStops))
         if (parsedState.bookings) setBookings(parsedState.bookings)
         if (parsedState.seats) setSeats(parsedState.seats)
         if (parsedState.queuePassengers) setQueuePassengers(parsedState.queuePassengers)
         if (parsedState.stopVoting) setStopVoting(parsedState.stopVoting)
-        if (parsedState.activeTab) setActiveTab(parsedState.activeTab)
 
-        // Восстанавливаем Map
         if (parsedState.stopHistoryMap) {
           const stopHistoryMap = new Map<number, StopHistory>()
           for (const key in parsedState.stopHistoryMap) {
@@ -356,7 +425,6 @@ export default function DriverDashboard() {
           setStopHistoryMap(stopHistoryMap)
         }
 
-        // Обновляем остановки
         const selectedRouteData = tripRoutes[parsedState.selectedTrip as keyof typeof tripRoutes]
         if (selectedRouteData) {
           setStops(parsedState.isDirectionReversed ? [...selectedRouteData.stops].reverse() : selectedRouteData.stops)
@@ -368,30 +436,22 @@ export default function DriverDashboard() {
       }
     }
 
-    // Важно: устанавливаем флаг загрузки в true в любом случае
     setIsStateLoaded(true)
   }, [])
 
-  // 2. СОХРАНЕНИЕ
   useEffect(() => {
-    // Не сохраняем, пока данные не загрузились первый раз
     if (!isStateLoaded) {
       return
     }
 
-    // Не сохраняем дефолтное состояние "подготовки", если нет ID поездки и таймер дефолтный
-    // Это предотвращает перезапись при пустом старте
     if (
       tripStatus === STATE.PREP_IDLE &&
       !tripId &&
       prepareTimer === 600 &&
-      selectedTrip === "247" &&
+      selectedTrip === "" &&
       !isDirectionReversed
     ) {
-      // Проверяем, не является ли это "первым рендером" с дефолтными данными поверх старых
-      // Но лучше сохранить, если мы уверены что загрузка прошла
-      // console.log("[v0] Skipping save of default idle state")
-      // return
+      return
     }
 
     const stopHistoryObject: Record<number, StopHistory> = {}
@@ -420,13 +480,12 @@ export default function DriverDashboard() {
       commission,
       isDepositAdded,
       activeTab,
+      preRaceState,
+      paymentFSM,
     }
 
     localStorage.setItem("driverAppState", JSON.stringify(stateToSave))
-    // console.log("[v0] State saved") // Раскомментируйте для отладки
   }, [
-    // ВАЖНО: Убран isStateLoaded из зависимостей, чтобы смена флага не триггерила сохранение
-    // Сохраняем только при изменении реальных данных:
     tripStatus,
     tripId,
     selectedTrip,
@@ -447,6 +506,9 @@ export default function DriverDashboard() {
     commission,
     isDepositAdded,
     activeTab,
+    preRaceState,
+    paymentFSM,
+    isStateLoaded,
   ])
 
   useEffect(() => {
@@ -470,6 +532,64 @@ export default function DriverDashboard() {
     setLanguage(lang)
   }
 
+  // ============================================================================
+  // FSM ПРЕДРЕЙСОВОГО ЭКРАНА - ФУНКЦИИ
+  // ============================================================================
+
+  const handlePreRaceTransition = (action: PreRaceAction, newRouteId?: string) => {
+    if (!preRaceState) return
+
+    const transition = PRE_RACE_FSM_TRANSITIONS.find(
+      t => t.from === preRaceState && t.action === action
+    )
+
+    if (!transition) {
+      logFSMEvent("fsm:pre_race_blocked", {
+        oldState: preRaceState,
+        action,
+        reason: "invalid_transition"
+      })
+      return
+    }
+
+    logFSMEvent("fsm:pre_race_transition", {
+      oldState: preRaceState,
+      newState: transition.to,
+      action,
+      details: { routeId: newRouteId }
+    })
+
+    setPreRaceState(transition.to)
+
+    // Побочные эффекты переходов
+    if (action === "select_route" && newRouteId) {
+      setSelectedTrip(newRouteId)
+      const selectedRouteData = tripRoutes[newRouteId as keyof typeof tripRoutes]
+      if (selectedRouteData) {
+        setStops(isDirectionReversed ? [...selectedRouteData.stops].reverse() : selectedRouteData.stops)
+      }
+    }
+
+    if (action === "toggle_direction") {
+      setIsDirectionReversed(!isDirectionReversed)
+      if (selectedTrip) {
+        const currentRoute = tripRoutes[selectedTrip as keyof typeof tripRoutes]
+        if (currentRoute) {
+          setStops([...stops].reverse())
+        }
+      }
+    }
+
+    if (action === "start_preparation") {
+      // Переход из предрейсового FSM в FSM рейса
+      setPreRaceState(null)
+    }
+  }
+
+  // ============================================================================
+  // FSM РЕЙСА - ФУНКЦИИ ПЕРЕХОДОВ
+  // ============================================================================
+
   const clickStartPrep = () => {
     if (userStatus !== "confirmed") {
       console.log("[v0] ui:blocked", { action: "startPrep", reason: "accountUnconfirmed" })
@@ -484,18 +604,28 @@ export default function DriverDashboard() {
       console.error("[v0] Illegal transition: clickStartPrep from", tripStatus)
       return
     }
-    // Геотрекер НЕ включаем в PREP_TIMER, включим позже
+
+    // Завершаем предрейсовый FSM
+    if (preRaceState === "ready_to_start") {
+      handlePreRaceTransition("start_preparation")
+    }
+
     setAreSeatsLocked(false)
     const newTripId = generateTripId()
     setTripId(newTripId)
     setTripStatus(STATE.PREP_TIMER)
     setPrepareTimer(600)
   }
+
   const clickCancelPrep = () => {
     if (tripStatus !== STATE.PREP_TIMER) {
       console.error("[v0] Illegal transition: clickCancelPrep from", tripStatus)
       return
     }
+
+    // Возвращаемся в предрейсовый FSM
+    setPreRaceState("ready_to_start")
+
     setIsGeoTrackerActive(false)
     setAreSeatsLocked(true)
     setPrepareTimer(600)
@@ -507,13 +637,13 @@ export default function DriverDashboard() {
       description: language === "ru" ? "Подготовка рейса отменена" : "Trip preparation cancelled",
     })
   }
+
   const clickStartBoarding = () => {
     if (tripStatus !== STATE.PREP_TIMER) {
       console.error("[v0] Illegal transition: clickStartBoarding from", tripStatus)
       return
     }
 
-    // СОЗДАЕМ КОНТЕКСТ ЛОКАЛЬНО
     const raceContext = createRaceContext({
       currentStopIndex,
       totalStops: stops.length,
@@ -524,7 +654,6 @@ export default function DriverDashboard() {
       tripId,
     })
 
-    // Валидация через FSM
     const validation = validateTransition("RACE_WAITING_START", "start_boarding", raceContext)
     if (!validation.valid) {
       logFSMEvent("transition:blocked", {
@@ -552,100 +681,91 @@ export default function DriverDashboard() {
   }
 
   const clickReadyForRoute = () => {
-  if (tripStatus !== STATE.BOARDING) {
-    console.error("[v0] Illegal transition: clickReadyForRoute from", tripStatus)
-    return
+    if (tripStatus !== STATE.BOARDING) {
+      console.error("[v0] Illegal transition: clickReadyForRoute from", tripStatus)
+      return
+    }
+    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+    setAreSeatsLocked(true)
+    setTripStatus(STATE.ROUTE_READY)
   }
-  setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
-  setAreSeatsLocked(true) // ДОБАВЛЕНО: блокируем панели
-  setTripStatus(STATE.ROUTE_READY)
-}
 
   const clickStartRoute = () => {
-  if (tripStatus !== STATE.ROUTE_READY && tripStatus !== STATE.BOARDING) {
-    console.error("[v0] Illegal transition: clickStartRoute from", tripStatus)
-    return
-  }
+    if (tripStatus !== STATE.ROUTE_READY && tripStatus !== STATE.BOARDING) {
+      console.error("[v0] Illegal transition: clickStartRoute from", tripStatus)
+      return
+    }
 
-  // СОЗДАЕМ КОНТЕКСТ ЛОКАЛЬНО
-  const raceContext = createRaceContext({
-    currentStopIndex,
-    totalStops: stops.length,
-    freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
-    occupiedSeats: manualOccupied,
-    hasActiveReservations: bookings.some(b => b.fromStopIndex === currentStopIndex && !b.scanned),
-    queueSize: queuePassengers.length,
-    tripId,
-  })
+    const raceContext = createRaceContext({
+      currentStopIndex,
+      totalStops: stops.length,
+      freeSeats: 6 - manualOccupied - bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0),
+      occupiedSeats: manualOccupied,
+      hasActiveReservations: bookings.some(b => b.fromStopIndex === currentStopIndex && !b.scanned),
+      queueSize: queuePassengers.length,
+      tripId,
+    })
 
-  // Определяем текущее состояние и действие
-  const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
-  const action = currentRaceState === "RACE_BOARDING" ? "depart_stop" : "continue_boarding"
+    const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
+    const action = currentRaceState === "RACE_BOARDING" ? "depart_stop" : "continue_boarding"
 
-  // Валидация через FSM
-  const validation = validateTransition(currentRaceState, action, raceContext)
-  
-  if (!validation.valid) {
-    logFSMEvent("transition:blocked", {
+    const validation = validateTransition(currentRaceState, action, raceContext)
+    
+    if (!validation.valid) {
+      logFSMEvent("transition:blocked", {
+        oldState: currentRaceState,
+        action: action,
+        details: { error: validation.error }
+      })
+      toast({
+        title: t.error,
+        description: validation.error,
+        variant: "destructive",
+      })
+      return
+    }
+    
+    logFSMEvent("transition:success", {
       oldState: currentRaceState,
+      newState: validation.nextState,
       action: action,
-      details: { error: validation.error }
     })
-    toast({
-      title: t.error,
-      description: validation.error,
-      variant: "destructive",
+
+    const reservedCount = bookings
+      .filter((b) => b.fromStopIndex === currentStopIndex && !b.scanned)
+      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+    const boardedCount = bookings
+      .filter((b) => b.fromStopIndex === currentStopIndex && b.scanned)
+      .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
+
+    setStopHistoryMap((prev) => {
+      const newMap = new Map(prev)
+      newMap.set(currentStopIndex, {
+        stopId: currentStopIndex,
+        reserved: reservedCount,
+        boarded: boardedCount,
+      })
+      return newMap
     })
-    return
+
+    setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
+
+    if (currentStopIndex + 1 >= stops.length - 1) {
+      setCurrentStopIndex(stops.length - 1)
+      setTripStatus(STATE.FINISHED)
+    } else {
+      setCurrentStopIndex(currentStopIndex + 1)
+      setAreSeatsLocked(true)
+      setTripStatus(STATE.IN_ROUTE)
+    }
   }
-  
-  logFSMEvent("transition:success", {
-    oldState: currentRaceState,
-    newState: validation.nextState,
-    action: action,
-  })
-
-  // ИСПРАВЛЕННЫЙ подсчет:
-  // Зарезервировано = все брони на этой остановке, которые еще НЕ отсканированы (не сели)
-  const reservedCount = bookings
-    .filter((b) => b.fromStopIndex === currentStopIndex && !b.scanned)
-    .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
-
-  // Посажено = те, кто успешно прошел сканирование на этой остановке
-  const boardedCount = bookings
-    .filter((b) => b.fromStopIndex === currentStopIndex && b.scanned)
-    .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
-
-  setStopHistoryMap((prev) => {
-    const newMap = new Map(prev)
-    newMap.set(currentStopIndex, {
-      stopId: currentStopIndex,
-      reserved: reservedCount,
-      boarded: boardedCount,
-    })
-    return newMap
-  })
-
-  setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
-
-  // Проверяем: если следующая остановка - конечная, сразу завершаем рейс
-  if (currentStopIndex + 1 >= stops.length - 1) {
-    setCurrentStopIndex(stops.length - 1)
-    setTripStatus(STATE.FINISHED)
-  } else {
-  setCurrentStopIndex(currentStopIndex + 1)
-  setAreSeatsLocked(true) // ДОБАВЛЕНО: блокируем панели во время движения
-  setTripStatus(STATE.IN_ROUTE)
-}
-}
-
-  const clickArrivedAtStop = () => {
+const clickArrivedAtStop = () => {
     if (tripStatus !== STATE.IN_ROUTE) {
       console.error("[v0] Illegal transition: clickArrivedAtStop from", tripStatus)
       return
     }
 
-    // СОЗДАЕМ КОНТЕКСТ ЛОКАЛЬНО
     const raceContext = createRaceContext({
       currentStopIndex,
       totalStops: stops.length,
@@ -656,7 +776,6 @@ export default function DriverDashboard() {
       tripId,
     })
 
-    // Валидация через FSM
     const validation = validateTransition("RACE_IN_TRANSIT", "arrive_stop", raceContext)
 
     if (!validation.valid) {
@@ -681,7 +800,6 @@ export default function DriverDashboard() {
 
     setVisitedStops((prev) => new Set(prev).add(currentStopIndex))
 
-    // Подсчет статистики ПЕРЕД переходом
     const stopBookings = bookings.filter((b) => b.fromStopIndex === currentStopIndex)
 
     const reservedCount = stopBookings
@@ -702,15 +820,12 @@ export default function DriverDashboard() {
       return newMap
     })
 
-    // Проверяем, конечная ли это остановка
     if (currentStopIndex === stops.length - 1) {
-      // Конечная остановка - завершаем рейс
       setTripStatus(STATE.FINISHED)
     } else {
-  // Промежуточная остановка - переходим в BOARDING для посадки
-  setAreSeatsLocked(false) // ДОБАВЛЕНО: разблокируем панели для посадки
-  setTripStatus(STATE.BOARDING)
-}
+      setAreSeatsLocked(false)
+      setTripStatus(STATE.BOARDING)
+    }
   }
 
   const clickFinish = () => {
@@ -719,7 +834,6 @@ export default function DriverDashboard() {
       return
     }
 
-    // СОЗДАЕМ КОНТЕКСТ ЛОКАЛЬНО
     const raceContext = createRaceContext({
       currentStopIndex,
       totalStops: stops.length,
@@ -730,7 +844,6 @@ export default function DriverDashboard() {
       tripId,
     })
 
-    // Валидация через FSM
     const validation = validateTransition("RACE_FINISHED", "end_shift", raceContext)
 
     if (!validation.valid) {
@@ -753,11 +866,14 @@ export default function DriverDashboard() {
       action: "end_shift",
     })
 
-    // Остальной код без изменений
+    // Возвращаемся в предрейсовый FSM
+    setPreRaceState("route_selection")
+
     setIsGeoTrackerActive(false)
     setAreSeatsLocked(true)
     setPrepareTimer(600)
     setTripId("")
+    setSelectedTrip("")
     setIsDirectionReversed(false)
     setTripStatus(STATE.PREP_IDLE)
     setCurrentStopIndex(0)
@@ -773,7 +889,15 @@ export default function DriverDashboard() {
     setManualOccupied(0)
     setIsDepositAdded(false)
 
-    // Сбросить статусы броней к начальному состоянию
+    // Сброс FSM оплаты
+    setPaymentFSM({
+      state: "idle",
+      context: {
+        paymentType: "cash",
+        amount: 0,
+      }
+    })
+
     setBookings([
       {
         id: 1,
@@ -844,42 +968,37 @@ export default function DriverDashboard() {
     ])
 
     setQueuePassengers([
-      { id: 1, name: "Петр С.", queuePosition: 1, isFirst: true, count: 1, ticketCount: 1, orderNumber: 1 },
-      { id: 2, name: "Анна М.", queuePosition: 2, isFirst: false, count: 2, ticketCount: 2, orderNumber: 2 },
-      { id: 3, name: "Игорь Л.", queuePosition: 3, isFirst: false, count: 1, ticketCount: 1, orderNumber: 3 },
-      { id: 4, name: "Ольга К.", queuePosition: 4, isFirst: false, count: 3, ticketCount: 3, orderNumber: 4 },
-      { id: 5, name: "Сергей Д.", queuePosition: 5, isFirst: false, count: 1, ticketCount: 1, orderNumber: 5 },
+      { id: 1, name: "Петр С.", queuePosition: 1, isFirst: true, count: 1, ticketCount: 1, orderNumber: 1, fsmState: "waiting" },
+      { id: 2, name: "Анна М.", queuePosition: 2, isFirst: false, count: 2, ticketCount: 2, orderNumber: 2, fsmState: "waiting" },
+      { id: 3, name: "Игорь Л.", queuePosition: 3, isFirst: false, count: 1, ticketCount: 1, orderNumber: 3, fsmState: "waiting" },
+      { id: 4, name: "Ольга К.", queuePosition: 4, isFirst: false, count: 3, ticketCount: 3, orderNumber: 4, fsmState: "waiting" },
+      { id: 5, name: "Сергей Д.", queuePosition: 5, isFirst: false, count: 1, ticketCount: 1, orderNumber: 5, fsmState: "waiting" },
     ])
   }
 
   const getTripButtonText = () => {
-  const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
-  const buttonConfig = getButtonConfig(currentRaceState, language)
-  
-  // Специальная логика для таймера
-  if (tripStatus === STATE.PREP_TIMER) {
-    return `${t.prepareTrip} ${formatTimer(prepareTimer)}`
+    const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
+    const buttonConfig = getButtonConfig(currentRaceState, language)
+    
+    if (tripStatus === STATE.PREP_TIMER) {
+      return `${t.prepareTrip} ${formatTimer(prepareTimer)}`
+    }
+    
+    if (tripStatus === STATE.BOARDING && currentStopIndex > 0) {
+      return language === "ru" ? "Посадка завершена" : "Boarding Complete"
+    }
+    
+    if (tripStatus === STATE.ROUTE_READY && currentStopIndex > 0) {
+      return language === "ru" ? "Продолжить рейс" : "Continue Trip"
+    }
+    
+    if (tripStatus === STATE.IN_ROUTE) {
+      const stopName = stops[currentStopIndex]?.name || ""
+      return language === "ru" ? `Прибыл ${stopName}` : `Arrived ${stopName}`
+    }
+    
+    return buttonConfig.label
   }
-  
-  // Специальные случаи для промежуточных остановок
-  if (tripStatus === STATE.BOARDING && currentStopIndex > 0) {
-    return language === "ru" ? "Посадка завершена" : "Boarding Complete"
-  }
-  
-  if (tripStatus === STATE.ROUTE_READY && currentStopIndex > 0) {
-    return language === "ru" ? "Продолжить рейс" : "Continue Trip"
-  }
-  
-  // Для IN_ROUTE показываем название остановки
-if (tripStatus === STATE.IN_ROUTE) {
-  // Если едем к конечной - не показываем её название, т.к. при прибытии сразу будет FINISHED
-  // currentStopIndex уже указывает на следующую остановку после отправления
-  const stopName = stops[currentStopIndex]?.name || ""
-  return language === "ru" ? `Прибыл ${stopName}` : `Arrived ${stopName}`
-}
-  
-  return buttonConfig.label
-}
 
   const getTripStatusEmoji = () => {
     if (tripStatus === STATE.IN_ROUTE) return "🚌"
@@ -899,28 +1018,31 @@ if (tripStatus === STATE.IN_ROUTE) {
   }
 
   const handleTripButton = () => {
-  if (tripStatus === STATE.PREP_IDLE) {
-    clickStartPrep()
-  } else if (tripStatus === STATE.PREP_TIMER) {
-    clickStartBoarding()
-  } else if (tripStatus === STATE.BOARDING) {
-    if (currentStopIndex === 0) {
-      clickStartRoute() // Первая остановка - отправление
-    } else {
-      clickReadyForRoute() // Промежуточная - завершение посадки
+    if (tripStatus === STATE.PREP_IDLE) {
+      clickStartPrep()
+    } else if (tripStatus === STATE.PREP_TIMER) {
+      clickStartBoarding()
+    } else if (tripStatus === STATE.BOARDING) {
+      if (currentStopIndex === 0) {
+        clickStartRoute()
+      } else {
+        clickReadyForRoute()
+      }
+    } else if (tripStatus === STATE.ROUTE_READY) {
+      clickStartRoute()
+    } else if (tripStatus === STATE.IN_ROUTE) {
+      clickArrivedAtStop()
+    } else if (tripStatus === STATE.FINISHED) {
+      clickFinish()
     }
-  } else if (tripStatus === STATE.ROUTE_READY) {
-    clickStartRoute()
-  } else if (tripStatus === STATE.IN_ROUTE) {
-    clickArrivedAtStop()
-  } else if (tripStatus === STATE.FINISHED) {
-    clickFinish()
   }
-}
+
+  // ============================================================================
+  // ОБРАБОТЧИКИ БРОНИРОВАНИЙ
+  // ============================================================================
 
   const handleOpenBookingScanner = (bookingId: number) => {
     if (areSeatsLocked) {
-      // Check if seats are locked
       console.log("[v0] ui:blocked", { action: "openBookingScanner", reason: "seatsLocked" })
       toast({
         title: t.error,
@@ -945,7 +1067,18 @@ if (tripStatus === STATE.IN_ROUTE) {
       return
     }
 
-    console.log("[v0] scan:start", { bookingId, timestamp: new Date().toISOString() }) // Changed log message
+    console.log("[v0] scan:start", { bookingId, timestamp: new Date().toISOString() })
+    
+    // FSM оплаты: переход в scan_qr
+    setPaymentFSM({
+      state: "scan_qr",
+      context: {
+        paymentType: "booking",
+        amount: bookings.find(b => b.id === bookingId)?.amount || 0,
+        passengerId: bookingId,
+      }
+    })
+
     setIsScanningLocked(true)
     setTempBookingId(bookingId)
     setScanningForQueue(false)
@@ -963,7 +1096,6 @@ if (tripStatus === STATE.IN_ROUTE) {
       return
     }
 
-    // Если бронь зарезервирована, открываем сканер QR
     if (booking.reserved) {
       console.log("[v0] accept:clicked", {
         bookingId: bookingId,
@@ -983,15 +1115,14 @@ if (tripStatus === STATE.IN_ROUTE) {
       return
     }
 
+    // FSM очереди: переход revert_scan
     setQueuePassengers(
       queuePassengers.map((p) =>
         p.id === passengerId
           ? {
               ...p,
-              showQRButtons: false,
+              fsmState: "waiting" as QueuePassengerState,
               qrData: undefined,
-              scanned: false, // Added: reset scanned status
-              qrError: undefined, // Added: reset qrError
             }
           : p,
       ),
@@ -1016,7 +1147,6 @@ if (tripStatus === STATE.IN_ROUTE) {
     const booking = bookings.find((b) => b.id === bookingId)
     if (!booking) return
 
-    // Если бронь зарезервирована, открываем сканер QR
     if (booking.reserved) {
       console.log("[v0] accept:clicked", {
         bookingId: bookingId,
@@ -1026,6 +1156,7 @@ if (tripStatus === STATE.IN_ROUTE) {
       handleOpenBookingScanner(bookingId)
     }
   }
+
   const handleReserveBooking = (bookingId: number) => {
     if (areSeatsLocked) {
       console.log("[v0] ui:blocked", { action: "reserveBooking", reason: "seatsLocked" })
@@ -1040,7 +1171,6 @@ if (tripStatus === STATE.IN_ROUTE) {
     const booking = bookings.find((b) => b.id === bookingId)
     if (!booking) return
 
-    // Проверяем наличие свободных мест
     const freeSeatsCount = 6 - manualOccupied - acceptedBookingsCount
     const bookingCount = booking.count || 1
 
@@ -1066,7 +1196,7 @@ if (tripStatus === STATE.IN_ROUTE) {
           ? {
               ...b,
               reserved: true,
-              accepted: true, // ДОБАВЛЕНО: устанавливаем accepted при резервировании
+              accepted: true,
             }
           : b,
       ),
@@ -1099,7 +1229,6 @@ if (tripStatus === STATE.IN_ROUTE) {
   const handleCancelBooking = (bookingId: number, isOnCurrentStop: boolean) => {
     setCancelBookingId(bookingId)
     setCancelReason("")
-    // Сохраняем информацию, это бронь на текущей остановке или нет
     setBookings((prev) =>
       prev.map((b) => (b.id === bookingId ? { ...b, cancelContext: isOnCurrentStop ? "boarding" : "future_stop" } : b)),
     )
@@ -1130,6 +1259,7 @@ if (tripStatus === STATE.IN_ROUTE) {
     setCancelBookingId(null)
     setCancelReason("")
   }
+
   const handleAcceptBookingQR = (bookingId: number) => {
     const booking = bookings.find((b) => b.id === bookingId)
     if (!booking || !booking.qrData) return
@@ -1138,6 +1268,15 @@ if (tripStatus === STATE.IN_ROUTE) {
       bookingId: bookingId,
       amount: booking.amount,
       timestamp: new Date().toISOString(),
+    })
+
+    // FSM оплаты: переход к success
+    setPaymentFSM({
+      state: "success",
+      context: {
+        ...paymentFSM.context,
+        amount: booking.amount,
+      }
     })
 
     const bookingCount = booking.count || 1
@@ -1162,10 +1301,20 @@ if (tripStatus === STATE.IN_ROUTE) {
     setSeats(updatedSeats)
     setBalance(balance + booking.amount)
 
-    // ИСПРАВЛЕНИЕ: Не удаляем, а помечаем как отсканированный
     setBookings((prev) =>
       prev.map((b) => (b.id === bookingId ? { ...b, scanned: true, accepted: true, showQRButtons: false } : b)),
     )
+
+    // Сброс FSM оплаты
+    setTimeout(() => {
+      setPaymentFSM({
+        state: "idle",
+        context: {
+          paymentType: "cash",
+          amount: 0,
+        }
+      })
+    }, 1000)
 
     toast({
       title: language === "ru" ? "Бронь принята" : "Booking accepted",
@@ -1183,6 +1332,15 @@ if (tripStatus === STATE.IN_ROUTE) {
       timestamp: new Date().toISOString(),
     })
 
+    // FSM оплаты: переход к idle
+    setPaymentFSM({
+      state: "idle",
+      context: {
+        paymentType: "cash",
+        amount: 0,
+      }
+    })
+
     setBookings(bookings.filter((b) => b.id !== bookingId))
 
     toast({
@@ -1194,6 +1352,16 @@ if (tripStatus === STATE.IN_ROUTE) {
 
   const handleRevertBookingQR = (bookingId: number) => {
     console.log("[v0] Reverting booking QR:", bookingId)
+    
+    // FSM оплаты: возврат к idle
+    setPaymentFSM({
+      state: "idle",
+      context: {
+        paymentType: "cash",
+        amount: 0,
+      }
+    })
+
     setBookings(bookings.map((b) => (b.id === bookingId ? { ...b, showQRButtons: false, qrData: undefined } : b)))
   }
 
@@ -1202,7 +1370,6 @@ if (tripStatus === STATE.IN_ROUTE) {
     const passenger = queuePassengers.find((p) => p.id === passengerId)
     if (!passenger) return
 
-    // Revert seat occupancy
     const seatsToFree = passenger.ticketCount
     setSeats((prevSeats) => {
       const occupiedSeats = prevSeats.filter((s) => s.status === "occupied" && s.passengerName === passenger.name)
@@ -1214,7 +1381,7 @@ if (tripStatus === STATE.IN_ROUTE) {
               status: "free" as const,
               passengerName: undefined,
               fromStop: undefined,
-              toTo: undefined,
+              toStop: undefined,
               paymentMethod: undefined,
               amountPaid: undefined,
             }
@@ -1222,9 +1389,8 @@ if (tripStatus === STATE.IN_ROUTE) {
       )
     })
 
-    // Reset passenger state
     setQueuePassengers(
-      queuePassengers.map((p) => (p.id === passengerId ? { ...p, showQRButtons: false, qrData: undefined } : p)),
+      queuePassengers.map((p) => (p.id === passengerId ? { ...p, fsmState: "waiting" as QueuePassengerState, qrData: undefined } : p)),
     )
   }
 
@@ -1246,6 +1412,15 @@ if (tripStatus === STATE.IN_ROUTE) {
         created_at: formatDateTime(new Date(Date.now() - Math.floor(Math.random() * 3600000))),
       }
 
+      // FSM оплаты: переход к confirm
+      setPaymentFSM({
+        state: "confirm",
+        context: {
+          ...paymentFSM.context,
+          qrData: mockQRData,
+        }
+      })
+
       setBookings(
         bookings.map((b) =>
           b.id === tempBookingId
@@ -1254,7 +1429,7 @@ if (tripStatus === STATE.IN_ROUTE) {
                 showQRButtons: true,
                 qrData: mockQRData,
                 qrError: undefined,
-                scanned: true, // Added: mark as scanned
+                scanned: true,
               }
             : b,
         ),
@@ -1285,10 +1460,8 @@ if (tripStatus === STATE.IN_ROUTE) {
           p.id === currentQueueScanId
             ? {
                 ...p,
-                showQRButtons: true,
+                fsmState: "scan_success" as QueuePassengerState,
                 qrData: mockQRData,
-                qrError: undefined,
-                scanned: true, // Added: mark as scanned
               }
             : p,
         ),
@@ -1307,7 +1480,16 @@ if (tripStatus === STATE.IN_ROUTE) {
       error: "Invalid QR",
       timestamp: new Date().toISOString(),
     })
-    // Added feedback for invalid QR
+
+    // FSM оплаты: переход к error
+    setPaymentFSM({
+      state: "error",
+      context: {
+        ...paymentFSM.context,
+        errorMessage: "Invalid QR code"
+      }
+    })
+
     toast({
       title: t.scanError,
       description: t.invalidQR,
@@ -1321,13 +1503,22 @@ if (tripStatus === STATE.IN_ROUTE) {
       timestamp: new Date().toISOString(),
     })
 
+    // FSM оплаты: переход к error
+    setPaymentFSM({
+      state: "error",
+      context: {
+        ...paymentFSM.context,
+        errorMessage: "QR not found"
+      }
+    })
+
     if (tempBookingId !== null && tempBookingId !== undefined) {
       setBookings(
         bookings.map((b) =>
           b.id === tempBookingId
             ? {
                 ...b,
-                qrError: language === "ru" ? "QR не найден" : "QR not found", // Added error message
+                qrError: language === "ru" ? "QR не найден" : "QR not found",
                 showRejectButton: true,
               }
             : b,
@@ -1339,8 +1530,7 @@ if (tripStatus === STATE.IN_ROUTE) {
           p.id === currentQueueScanId
             ? {
                 ...p,
-                qrError: language === "ru" ? "QR не найден" : "QR not found", // Added error message
-                showRejectButton: true,
+                fsmState: "scan_error" as QueuePassengerState,
               }
             : p,
         ),
@@ -1351,10 +1541,13 @@ if (tripStatus === STATE.IN_ROUTE) {
     setIsScanningLocked(false)
   }
 
-  // Added accept/reject for queue passengers after QR scan
-  const handleAcceptQueueQR = (passengerId: number) => {
+  // ============================================================================
+  // ОБРАБОТЧИКИ ОЧЕРЕДИ (используют FSM из компонента)
+  // ============================================================================
+
+  const handleAcceptQueuePassenger = (passengerId: number) => {
     const passenger = queuePassengers.find((p) => p.id === passengerId)
-    if (!passenger || !passenger.qrData) return
+    if (!passenger || passenger.fsmState !== "scan_success") return
 
     console.log("[v0] accept:clicked", {
       passengerId: passengerId,
@@ -1365,7 +1558,6 @@ if (tripStatus === STATE.IN_ROUTE) {
     const passengerCount = passenger.ticketCount || 1
     setManualOccupied((prev) => prev + passengerCount)
 
-    // Find available seats and mark them as occupied
     let seatsToOccupy = passengerCount
     const updatedSeats = [...seats]
 
@@ -1376,16 +1568,18 @@ if (tripStatus === STATE.IN_ROUTE) {
           status: "occupied",
           passengerName: passenger.name,
           paymentMethod: "qr",
-          fromStop: stops.findIndex((s) => s.id === 0), // Assuming start stop for queue passengers
-          toStop: stops.length - 1, // Assuming end stop for queue passengers
+          fromStop: stops.findIndex((s) => s.id === 0),
+          toStop: stops.length - 1,
         }
         seatsToOccupy--
       }
     }
 
     setSeats(updatedSeats)
+    
+    // Удаляем пассажира из очереди (FSM: accepted)
     setQueuePassengers(queuePassengers.filter((p) => p.id !== passengerId))
-    setQrScannedData(null) // Clear scanned data
+    setQrScannedData(null)
 
     toast({
       title: language === "ru" ? "Пассажир принят" : "Passenger accepted",
@@ -1393,13 +1587,13 @@ if (tripStatus === STATE.IN_ROUTE) {
     })
   }
 
-  // Added reject for queue passengers after QR scan
-  const handleRejectQueueQR = (passengerId: number) => {
+  const handleRejectQueuePassenger = (passengerId: number) => {
     console.log("[v0] reject:clicked", {
       passengerId: passengerId,
       timestamp: new Date().toISOString(),
     })
 
+    // Удаляем пассажира из очереди (FSM: rejected)
     setQueuePassengers(queuePassengers.filter((p) => p.id !== passengerId))
     setQrScannedData(null)
 
@@ -1421,16 +1615,27 @@ if (tripStatus === STATE.IN_ROUTE) {
     localStorage.removeItem("driverAuthenticated")
     localStorage.removeItem("userStatus")
     setIsAuthenticated(false)
-    setUserStatus("pending") // Reset to default
+    setUserStatus("pending")
     setTripStatus(STATE.PREP_IDLE)
     setTripId("")
     setSelectedTrip("")
-    setAreSeatsLocked(true) // Lock seats on logout
+    setAreSeatsLocked(true)
+    
+    // Сброс FSM состояний
+    setPreRaceState("route_selection")
+    setPaymentFSM({
+      state: "idle",
+      context: {
+        paymentType: "cash",
+        amount: 0,
+      }
+    })
   }
 
   const handleToggleDirection = () => {
-    setIsDirectionReversed(!isDirectionReversed)
-    setStops([...stops].reverse())
+    if (preRaceState === "direction_selection" || preRaceState === "route_confirmed") {
+      handlePreRaceTransition("toggle_direction")
+    }
   }
 
   const handleRejectQRNotFoundBooking = (bookingId: number) => {
@@ -1454,10 +1659,8 @@ if (tripStatus === STATE.IN_ROUTE) {
         if (nextBooking) {
           console.log("[v0] Opening scanner for highlighted booking:", nextBooking.id)
 
-          // Remove rejected booking
           setBookings(bookings.filter((b) => b.id !== bookingId))
 
-          // Open scanner for highlighted booking
           setTimeout(() => {
             setTempBookingId(nextBooking.id)
             setScanningForQueue(false)
@@ -1470,7 +1673,6 @@ if (tripStatus === STATE.IN_ROUTE) {
       }
     }
 
-    // If no highlighted booking, just remove the rejected one
     setBookings(bookings.filter((b) => b.id !== bookingId))
     setHighlightedBookingId(null)
 
@@ -1481,16 +1683,14 @@ if (tripStatus === STATE.IN_ROUTE) {
     })
   }
 
-  const handleRejectQueuePassenger = (passengerId: number) => {
+  const handleRejectQueuePassengerError = (passengerId: number) => {
     const passenger = queuePassengers.find((p) => p.id === passengerId)
     if (!passenger) return
 
     console.log("[v0] Rejecting queue passenger with QR error:", passengerId)
 
-    // Find next unprocessed passenger
-    const nextPassenger = queuePassengers.find((p) => !p.scanned && !p.qrError)
+    const nextPassenger = queuePassengers.find((p) => p.fsmState === "waiting")
 
-    // Remove rejected passenger
     setQueuePassengers(queuePassengers.filter((p) => p.id !== passengerId))
 
     if (nextPassenger) {
@@ -1501,7 +1701,6 @@ if (tripStatus === STATE.IN_ROUTE) {
         description: language === "ru" ? `Следующий: ${nextPassenger.name}` : `Next: ${nextPassenger.name}`,
       })
 
-      // Open scanner for next passenger
       setTimeout(() => {
         setCurrentQueueScanId(nextPassenger.id)
         setScanningForQueue(true)
@@ -1528,14 +1727,10 @@ if (tripStatus === STATE.IN_ROUTE) {
       return
     }
 
-    setSelectedTrip(tripNumber)
-    const selectedRouteData = tripRoutes[tripNumber as keyof typeof tripRoutes] // Use tripRoutes directly
-    if (selectedRouteData) {
-      setStops(selectedRouteData.stops)
-    }
+    // FSM предрейсового экрана: переход select_route
+    handlePreRaceTransition("select_route", tripNumber)
   }
-
-  useEffect(() => {
+useEffect(() => {
     if (!selectedTrip) return
     const currentRoute = tripRoutes[selectedTrip as keyof typeof tripRoutes]
     if (currentRoute) {
@@ -1547,10 +1742,11 @@ if (tripStatus === STATE.IN_ROUTE) {
     const actualOccupied = seats.filter((s) => s.status === "occupied").length
     setManualOccupied(actualOccupied)
   }, [seats])
+
   useEffect(() => {
-    // Блокируем дропдаун с момента начала таймера до завершения рейса
     setIsRouteDropdownDisabled(tripStatus !== STATE.PREP_IDLE)
   }, [tripStatus])
+
   const handleScanQueueQR = () => {
     if (areSeatsLocked) {
       console.log("[v0] ui:blocked", {
@@ -1560,7 +1756,6 @@ if (tripStatus === STATE.IN_ROUTE) {
       return
     }
 
-    // Check if scan is already in progress to prevent duplicate events
     if (scanInProgressRef.current) {
       console.log("[v0] ui:blocked", {
         action: "openQueueScanner",
@@ -1569,8 +1764,7 @@ if (tripStatus === STATE.IN_ROUTE) {
       return
     }
 
-    // Find the next unscanned passenger without error
-    const nextPassenger = queuePassengers.find((p) => !p.scanned && !p.qrError)
+    const nextPassenger = queuePassengers.find((p) => p.fsmState === "waiting")
     if (!nextPassenger) {
       toast({
         title: language === "ru" ? "Нет пассажиров для сканирования" : "No passengers to scan",
@@ -1624,12 +1818,11 @@ if (tripStatus === STATE.IN_ROUTE) {
 
       updatedPassengers[passengerIndex] = {
         ...passenger,
-        scanned: true,
-        qrError: false,
+        fsmState: "scan_success" as QueuePassengerState,
         qrData: {
-          amount: qrResult.sum || 0,
+          sum: qrResult.sum || 0,
           recipient: qrResult.recipient || "",
-          createdAt: qrResult.created_at || "",
+          created_at: qrResult.created_at || "",
         },
       }
       setQueuePassengers(updatedPassengers)
@@ -1649,8 +1842,7 @@ if (tripStatus === STATE.IN_ROUTE) {
 
       updatedPassengers[passengerIndex] = {
         ...passenger,
-        qrError: true,
-        scanned: false,
+        fsmState: "scan_error" as QueuePassengerState,
       }
       setQueuePassengers(updatedPassengers)
 
@@ -1666,7 +1858,6 @@ if (tripStatus === STATE.IN_ROUTE) {
       })
     }
 
-    // Reset scan state to allow next scan
     setCurrentQueueScanId(null)
     setIsScanningLocked(false)
     scanInProgressRef.current = false
@@ -1674,7 +1865,6 @@ if (tripStatus === STATE.IN_ROUTE) {
 
   const handleOpenPassengerScanner = (passengerId: number) => {
     if (areSeatsLocked) {
-      // Check if seats are locked
       console.log("[v0] ui:blocked", { action: "openPassengerScanner", reason: "seatsLocked" })
       toast({
         title: t.error,
@@ -1713,7 +1903,7 @@ if (tripStatus === STATE.IN_ROUTE) {
   const acceptedBookingsCount = bookings.filter((b) => b.accepted).reduce((sum, b) => sum + (b.count || 1), 0)
   const freeCount = 6 - occupiedCount - acceptedBookingsCount
   const pendingBookingsCount = bookings.filter((b) => !b.accepted).reduce((sum, b) => sum + (b.count || 1), 0)
-  // Вычисляем панели для UI (используется только для отображения)
+
   const currentRaceState = TRIP_STATUS_TO_RACE_STATE[tripStatus]
   const panelVisibility = getPanelVisibility(currentRaceState, {
     currentStopIndex,
@@ -1746,12 +1936,15 @@ if (tripStatus === STATE.IN_ROUTE) {
 
   const canStartTrip = selectedTrip !== "" && tripStatus === STATE.PREP_IDLE && userStatus === "confirmed"
 
+  // ============================================================================
+  // РЕНДЕРИНГ - ЭКРАНЫ АВТОРИЗАЦИИ
+  // ============================================================================
+
   if (!isAuthenticated) {
     if (showRegister) {
       return (
         <RegisterForm
           onRegister={() => {
-            // Mock: new users are pending by default
             setUserStatus("pending")
             setShowRegister(false)
             setIsAuthenticated(true)
@@ -1769,7 +1962,6 @@ if (tripStatus === STATE.IN_ROUTE) {
         onLogin={() => {
           setIsAuthenticated(true)
           localStorage.setItem("driverAuthenticated", "true")
-          // Test account is always approved
           setUserStatus("confirmed")
           localStorage.setItem("userStatus", "confirmed")
         }}
@@ -1796,7 +1988,6 @@ if (tripStatus === STATE.IN_ROUTE) {
               </p>
               <Button
                 onClick={() => {
-                  // Refresh account status (mock)
                   toast({
                     title: language === "ru" ? "Обновлено" : "Refreshed",
                     description: language === "ru" ? "Статус аккаунта обновлен" : "Account status refreshed",
@@ -1824,12 +2015,20 @@ if (tripStatus === STATE.IN_ROUTE) {
     )
   }
 
+  // ============================================================================
+  // РЕНДЕРИНГ - ГЛАВНЫЙ ЭКРАН
+  // ============================================================================
+
   return (
     <div className="min-h-screen bg-gray-50 p-2 sm:p-4">
       <div className="bg-card border-b border-border px-4 py-4 sticky top-0 z-10 shadow-sm rounded-lg mb-4">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2 flex-1">
-            <Select value={selectedTrip} onValueChange={handleSelectRoute} disabled={userStatus !== "confirmed"}>
+            <Select 
+              value={selectedTrip} 
+              onValueChange={handleSelectRoute} 
+              disabled={userStatus !== "confirmed" || isRouteDropdownDisabled}
+            >
               <SelectTrigger
                 className={`${isRouteDropdownDisabled || (selectedTrip && tripStatus === STATE.PREP_IDLE) ? "w-auto min-w-40 max-w-full" : "w-auto min-w-48 max-w-full"} h-auto min-h-10 ${
                   isRouteDropdownDisabled ? "opacity-50 cursor-not-allowed" : ""
@@ -1853,7 +2052,7 @@ if (tripStatus === STATE.IN_ROUTE) {
                 </SelectItem>
               </SelectContent>
             </Select>
-            {tripStatus === STATE.PREP_IDLE && (
+            {tripStatus === STATE.PREP_IDLE && selectedTrip && (
               <Button
                 variant="outline"
                 size="icon"
@@ -1936,7 +2135,6 @@ if (tripStatus === STATE.IN_ROUTE) {
                   size="sm"
                   variant="outline"
                   onClick={() => {
-                    // Mock status refresh
                     toast({
                       title: language === "ru" ? "Статус проверен" : "Status checked",
                       description: language === "ru" ? "Ожидание подтверждения" : "Awaiting confirmation",
@@ -1999,8 +2197,7 @@ if (tripStatus === STATE.IN_ROUTE) {
                       {getTripButtonText()}
                     </Button>
 
-                    {/* ИЗМЕНЕНИЕ: Добавлена кнопка реверса направления в статусе PREP_IDLE */}
-                    {tripStatus === STATE.PREP_IDLE && (
+                    {tripStatus === STATE.PREP_IDLE && selectedTrip && (
                       <Button
                         variant="outline"
                         size="lg"
@@ -2045,7 +2242,7 @@ if (tripStatus === STATE.IN_ROUTE) {
 
       <div className="px-2 pt-4 space-y-6">
         {selectedTrip && panelVisibility.cash !== "hidden" && !isPanelsDisabled && (
-  <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
+          <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
             <h2 className="text-lg font-bold text-foreground mb-4">{t.seats}</h2>
             <div className="grid grid-cols-4 gap-3">
               <div className="text-center p-4 rounded-lg bg-secondary">
@@ -2091,7 +2288,7 @@ if (tripStatus === STATE.IN_ROUTE) {
         )}
 
         {panelVisibility.queue !== "hidden" && selectedTrip && 6 - manualOccupied - acceptedBookingsCount > 0 && !isPanelsDisabled && (
-  <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
+          <Card className={`p-4 border-2 border-border ${isPanelsDisabled ? "opacity-50 pointer-events-none" : ""}`}>
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
                 <Users className="h-5 w-5 text-primary" />
@@ -2105,70 +2302,9 @@ if (tripStatus === STATE.IN_ROUTE) {
             <QueueQRScanner
               passengers={queuePassengers}
               onUpdate={setQueuePassengers}
-              onAccept={(passengerId) => {
-                const passenger = queuePassengers.find((p) => p.id === passengerId)
-                if (!passenger) return
-
-                const seatCountToAdd = passenger.ticketCount || 1
-                setManualOccupied((prev) => prev + seatCountToAdd)
-                setQueuePassengers(queuePassengers.filter((p) => p.id !== passengerId))
-
-                // logFSMEvent("accept:success", {
-                //   passengerId,
-                //   seatsAdded: seatCountToAdd,
-                // })
-
-                toast({
-                  title: language === "ru" ? "Пассажир принят" : "Passenger accepted",
-                  description: passenger.name,
-                })
-              }}
-              onReject={(passengerId) => {
-                const passenger = queuePassengers.find((p) => p.id === passengerId)
-                setQueuePassengers(queuePassengers.filter((p) => p.id !== passengerId))
-
-                // logFSMEvent("reject:success", { passengerId })
-
-                toast({
-                  title: language === "ru" ? "Пассажир отклонён" : "Passenger rejected",
-                  description: passenger?.name,
-                  variant: "destructive",
-                })
-              }}
-              onReturn={(passengerId) => {
-                const passenger = queuePassengers.find((p) => p.id === passengerId)
-                if (!passenger) return
-
-                const seatCountToRevert = passenger.ticketCount || 1
-
-                setQueuePassengers(
-                  queuePassengers.map((p) =>
-                    p.id === passengerId
-                      ? {
-                          ...p,
-                          showQRButtons: false,
-                          qrData: undefined,
-                          scanned: false,
-                          qrError: false,
-                        }
-                      : p,
-                  ),
-                )
-
-                if (passenger.scanned) {
-                  setManualOccupied((prev) => Math.max(0, prev - seatCountToRevert))
-                }
-
-                // logFSMEvent("return:success", {
-                //   passengerId,
-                //   seatsReverted: seatCountToRevert,
-                // })
-
-                toast({
-                  title: language === "ru" ? "Возврат" : "Return",
-                  description: language === "ru" ? "Операция отменена" : "Operation canceled",
-                })
-              }}
+              onAccept={handleAcceptQueuePassenger}
+              onReject={handleRejectQueuePassenger}
+              onReturn={handleReturnQueuePassenger}
               disabled={isPanelsDisabled}
               language={language}
               t={t}
@@ -2198,46 +2334,31 @@ if (tripStatus === STATE.IN_ROUTE) {
                 .map((stop, index, array) => {
                   const stopBookings = bookings.filter((b) => b.fromStopIndex === stop.id)
 
-                  // Посажено: те, у кого scanned: true
                   const historyBoarded = stopBookings
                     .filter((b) => b.scanned)
                     .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
 
-                  // Зарезервировано: те, кто есть в списке броней, но еще не scanned
                   const historyReserved = stopBookings
                     .filter((b) => !b.scanned)
                     .reduce((sum, b) => sum + (b.passengerCount || b.count || 1), 0)
 
-                  // И в блоке отрисовки карточек добавьте фильтр !booking.scanned,
-                  // чтобы севшие пассажиры исчезали из списка "активных" на остановке:
                   const visibleBookings = stopBookings.filter((b) => {
                     return !b.scanned && (b.reserved || freeCount >= (b.count || 1))
                   })
 
                   const isPastStop = visitedStops.has(stop.id) && stop.id < currentStopIndex
 
-                  // НОВАЯ ЛОГИКА: Показываем остановку если:
-                  // 1. Это прошедшая остановка (isPastStop)
-                  // 2. Есть хоть какие-то бронирования (stopBookings.length > 0)
-                  // 3. Это текущая остановка (stop.id === currentStopIndex)
+                  if (stop.id === 0 && stopBookings.length === 0) {
+                    return null
+                  }
 
-                 // Скрываем:
-// - Начальную остановку БЕЗ броней
-// - Конечную остановку (на ней не может быть броней для посадки)
-// - Будущие остановки БЕЗ броней
-if (stop.id === 0 && stopBookings.length === 0) {
-  return null
-}
+                  if (stop.id === stops[stops.length - 1].id) {
+                    return null
+                  }
 
-// Скрываем конечную остановку - там только высадка
-if (stop.id === stops[stops.length - 1].id) {
-  return null
-}
-
-// Если это не прошлая остановка И нет никаких бронирований - скрываем
-if (!isPastStop && stopBookings.length === 0) {
-  return null
-}
+                  if (!isPastStop && stopBookings.length === 0) {
+                    return null
+                  }
 
                   return (
                     <div key={stop.id} className={isPastStop ? "opacity-50" : ""}>
@@ -2254,7 +2375,6 @@ if (!isPastStop && stopBookings.length === 0) {
                             <div>
                               <h3 className="font-semibold text-base text-foreground">{stop.name}</h3>
 
-                              {/* ИСТОРИЯ: Показываем для прошедших остановок */}
                               {isPastStop && (
                                 <div className="text-xs text-muted-foreground mt-1 font-medium">
                                   {(() => {
@@ -2264,7 +2384,6 @@ if (!isPastStop && stopBookings.length === 0) {
                                         ? `Зарезервировано: ${history.reserved}, Посажено: ${history.boarded}`
                                         : `Reserved: ${history.reserved}, Boarded: ${history.boarded}`
                                     }
-                                    // Fallback
                                     return language === "ru"
                                       ? `Зарезервировано: ${historyReserved}, Посажено: ${historyBoarded}`
                                       : `Reserved: ${historyReserved}, Boarded: ${historyBoarded}`
@@ -2274,7 +2393,6 @@ if (!isPastStop && stopBookings.length === 0) {
                             </div>
                           </div>
 
-                          {/* Карточки бронирований показываем только на АКТУАЛЬНОЙ остановке */}
                           {visibleBookings.length > 0 && !isPastStop && (
                             <div className="space-y-2 mt-3">
                               {visibleBookings.map((booking) => (
@@ -2396,7 +2514,7 @@ if (!isPastStop && stopBookings.length === 0) {
                                         className="flex-1 h-9 text-sm font-semibold"
                                         variant="default"
                                         size="sm"
-                                        disabled={isPanelsDisabled || stop.id !== currentStopIndex} // ДОБАВЛЕНО: проверка остановки
+                                        disabled={isPanelsDisabled || stop.id !== currentStopIndex}
                                       >
                                         <QrCode className="mr-2 h-4 w-4" />
                                         {t.scanQR}
@@ -2479,6 +2597,17 @@ if (!isPastStop && stopBookings.length === 0) {
             setTempBookingId(null)
             setQrScannedData(null)
             scanInProgressRef.current = false
+            
+            // Сброс FSM оплаты при закрытии
+            if (paymentFSM.state !== "idle") {
+              setPaymentFSM({
+                state: "idle",
+                context: {
+                  paymentType: "cash",
+                  amount: 0,
+                }
+              })
+            }
           }
         }}
         driverName={language === "ru" ? "Водитель Иванов И.И." : "Driver Ivanov I."}

@@ -1,4 +1,4 @@
-// lib/fsm-types.ts - ИСПРАВЛЕННАЯ АРХИТЕКТУРА FSM
+// lib/fsm-types.ts - ПОЛНАЯ АРХИТЕКТУРА FSM
 
 // ============================================================================
 // СЕРВЕРНЫЕ СОСТОЯНИЯ (RaceState) - источник истины
@@ -12,7 +12,7 @@ export type RaceState =
   | "RACE_FINISHED";
 
 // ============================================================================
-// КОНТЕКСТ РЕЙСА - данные, необходимые для принятия решений
+// КОНТЕКСТ РЕЙСА
 // ============================================================================
 export interface RaceContext {
   currentStopIndex: number;
@@ -26,7 +26,7 @@ export interface RaceContext {
 }
 
 // ============================================================================
-// РАЗРЕШЁННЫЕ ПЕРЕХОДЫ - явное описание FSM
+// РАЗРЕШЁННЫЕ ПЕРЕХОДЫ РЕЙСА
 // ============================================================================
 export type TransitionAction =
   | "start_shift"
@@ -38,7 +38,6 @@ export type TransitionAction =
   | "end_shift"
   | "none";
 
-// Описание перехода
 export interface Transition {
   from: RaceState;
   to: RaceState;
@@ -46,7 +45,6 @@ export interface Transition {
   guard?: (context: RaceContext) => boolean;
 }
 
-// Граф переходов FSM
 export const FSM_TRANSITIONS: Transition[] = [
   {
     from: "RACE_OFFLINE",
@@ -87,65 +85,183 @@ export const FSM_TRANSITIONS: Transition[] = [
   },
 ];
 
-// Валидация перехода
-export function canTransition(
-  currentState: RaceState,
-  action: TransitionAction,
-  context: RaceContext
-): boolean {
-  const transition = FSM_TRANSITIONS.find(
-    (t) => t.from === currentState && t.action === action
-  );
+// ============================================================================
+// FSM ЭЛЕКТРОННОЙ ОЧЕРЕДИ (Скриншот 1)
+// ============================================================================
 
-  if (!transition) {
-    return false;
-  }
+export type QueuePassengerState = 
+  | "waiting"
+  | "selected"
+  | "scanning"
+  | "scan_success"
+  | "scan_error"
+  | "accepted"
+  | "rejected";
 
-  if (transition.guard && !transition.guard(context)) {
-    return false;
-  }
-
-  return true;
+export interface QueueContext {
+  passengerId: number;
+  queuePosition: number;
+  ticketCount: number;
+  qrScanned: boolean;
+  qrValid: boolean;
 }
 
-// Получить следующее состояние
-export function getNextState(
-  currentState: RaceState,
-  action: TransitionAction,
-  context: RaceContext
-): RaceState | null {
-  if (!canTransition(currentState, action, context)) {
-    return null;
-  }
+export type QueueAction =
+  | "select_passenger"
+  | "start_scan"
+  | "scan_success"
+  | "scan_error"
+  | "retry_scan"
+  | "accept_passenger"
+  | "reject_passenger"
+  | "revert_scan";
 
-  const transition = FSM_TRANSITIONS.find(
-    (t) => t.from === currentState && t.action === action
-  );
+export const QUEUE_FSM_TRANSITIONS: Array<{
+  from: QueuePassengerState;
+  to: QueuePassengerState;
+  action: QueueAction;
+}> = [
+  { from: "waiting", to: "selected", action: "select_passenger" },
+  { from: "selected", to: "scanning", action: "start_scan" },
+  { from: "scanning", to: "scan_success", action: "scan_success" },
+  { from: "scanning", to: "scan_error", action: "scan_error" },
+  { from: "scan_error", to: "scanning", action: "retry_scan" },
+  { from: "scan_success", to: "accepted", action: "accept_passenger" },
+  { from: "scan_success", to: "rejected", action: "reject_passenger" },
+  { from: "scan_error", to: "waiting", action: "revert_scan" },
+  { from: "scan_success", to: "waiting", action: "revert_scan" },
+];
 
-  return transition?.to || null;
+// ============================================================================
+// FSM ОПЛАТЫ/ДЕПОЗИТА (Скриншот 2)
+// ============================================================================
+
+export type PaymentState =
+  | "idle"
+  | "scan_qr"
+  | "enter_amount"
+  | "confirm"
+  | "processing"
+  | "success"
+  | "error";
+
+export interface PaymentContext {
+  paymentType: "booking" | "queue" | "deposit" | "cash";
+  amount: number;
+  passengerId?: number;
+  qrData?: {
+    sum: number;
+    recipient: string;
+    created_at: string;
+  };
+  errorMessage?: string;
 }
 
-// Получить доступные действия для текущего состояния
-export function getAvailableActions(
-  currentState: RaceState,
-  context: RaceContext
-): TransitionAction[] {
-  return FSM_TRANSITIONS.filter(
-    (t) => t.from === currentState && (!t.guard || t.guard(context))
-  ).map((t) => t.action);
+export type PaymentAction =
+  | "start_scan"
+  | "qr_scanned"
+  | "qr_invalid"
+  | "amount_entered"
+  | "confirm_payment"
+  | "payment_processed"
+  | "payment_failed"
+  | "retry"
+  | "cancel";
+
+export const PAYMENT_FSM_TRANSITIONS: Array<{
+  from: PaymentState;
+  to: PaymentState;
+  action: PaymentAction;
+}> = [
+  { from: "idle", to: "scan_qr", action: "start_scan" },
+  { from: "scan_qr", to: "confirm", action: "qr_scanned" },
+  { from: "scan_qr", to: "error", action: "qr_invalid" },
+  { from: "idle", to: "enter_amount", action: "amount_entered" },
+  { from: "enter_amount", to: "confirm", action: "confirm_payment" },
+  { from: "confirm", to: "processing", action: "payment_processed" },
+  { from: "processing", to: "success", action: "payment_processed" },
+  { from: "processing", to: "error", action: "payment_failed" },
+  { from: "error", to: "scan_qr", action: "retry" },
+  { from: "error", to: "idle", action: "cancel" },
+  { from: "success", to: "idle", action: "cancel" },
+];
+
+// ============================================================================
+// FSM ПРЕДРЕЙСОВОГО ЭКРАНА (Скриншот 3)
+// ============================================================================
+
+export type PreRaceState =
+  | "route_selection"
+  | "direction_selection"
+  | "route_confirmed"
+  | "ready_to_start";
+
+export interface PreRaceContext {
+  selectedRouteId: string | null;
+  isDirectionReversed: boolean;
+  routeStops: Array<{ id: number; name: string; time: string }>;
+  canStartTrip: boolean;
+}
+
+export type PreRaceAction =
+  | "select_route"
+  | "toggle_direction"
+  | "confirm_route"
+  | "start_preparation";
+
+export const PRE_RACE_FSM_TRANSITIONS: Array<{
+  from: PreRaceState;
+  to: PreRaceState;
+  action: PreRaceAction;
+}> = [
+  { from: "route_selection", to: "direction_selection", action: "select_route" },
+  { from: "direction_selection", to: "direction_selection", action: "toggle_direction" },
+  { from: "direction_selection", to: "route_confirmed", action: "confirm_route" },
+  { from: "route_confirmed", to: "ready_to_start", action: "start_preparation" },
+];
+
+// ============================================================================
+// АГРЕГИРОВАННОЕ СОСТОЯНИЕ ЭКРАНА ВОДИТЕЛЯ
+// ============================================================================
+
+export interface DriverScreenState {
+  preRaceState: PreRaceState | null;
+  raceState: RaceState;
+  queuePanelMode: QueuePanelMode;
+  cashPanelMode: CashPanelMode;
 }
 
 // ============================================================================
-// UI FSM СОСТОЯНИЯ (для кнопок)
+// UI FSM СОСТОЯНИЯ
 // ============================================================================
 export type UIFSMState = "idle" | "processing" | "success" | "error" | "disabled";
 
 // ============================================================================
-// РЕЖИМЫ ПАНЕЛЕЙ (не boolean!)
+// РЕЖИМЫ ПАНЕЛЕЙ (расширенные)
 // ============================================================================
-export type QueuePanelMode = "hidden" | "active" | "locked";
-export type ReservationPanelMode = "hidden" | "waiting" | "confirming" | "expired";
-export type CashPanelMode = "hidden" | "active";
+
+export type QueuePanelMode = 
+  | "hidden"
+  | "active"
+  | "locked"
+  | "scanning"
+  | "awaiting_decision";
+
+export type ReservationPanelMode = 
+  | "hidden" 
+  | "waiting" 
+  | "confirming" 
+  | "expired";
+
+export type CashPanelMode = 
+  | "hidden"
+  | "active"
+  | "scanning"
+  | "entering_amount"
+  | "confirming"
+  | "processing"
+  | "success"
+  | "error";
 
 export interface PanelVisibility {
   mainButton: boolean;
@@ -165,7 +281,7 @@ export interface ButtonConfig {
 }
 
 // ============================================================================
-// МАППИНГ: RaceState → ButtonConfig (МНОГОЯЗЫЧНЫЙ)
+// МАППИНГ: RaceState → ButtonConfig
 // ============================================================================
 export function getButtonConfig(
   state: RaceState,
@@ -228,38 +344,14 @@ export function getButtonConfig(
   return configs[state];
 }
 
-// Старый маппинг для обратной совместимости (deprecated)
+// Legacy
 export const RACE_STATE_TO_BUTTON: Record<RaceState, ButtonConfig> = {
-  RACE_OFFLINE: {
-    label: "Выйти на линию",
-    action: "start_shift",
-    enabled: true,
-  },
-  RACE_WAITING_START: {
-    label: "Начать посадку",
-    action: "start_boarding",
-    enabled: true,
-  },
-  RACE_BOARDING: {
-    label: "Отправиться",
-    action: "depart_stop",
-    enabled: true,
-  },
-  RACE_IN_TRANSIT: {
-    label: "Прибыл",
-    action: "arrive_stop",
-    enabled: true,
-  },
-  RACE_ARRIVED_STOP: {
-    label: "Продолжить",
-    action: "continue_boarding",
-    enabled: true,
-  },
-  RACE_FINISHED: {
-    label: "Завершить рейс",
-    action: "end_shift",
-    enabled: true,
-  },
+  RACE_OFFLINE: { label: "Выйти на линию", action: "start_shift", enabled: true },
+  RACE_WAITING_START: { label: "Начать посадку", action: "start_boarding", enabled: true },
+  RACE_BOARDING: { label: "Отправиться", action: "depart_stop", enabled: true },
+  RACE_IN_TRANSIT: { label: "Прибыл", action: "arrive_stop", enabled: true },
+  RACE_ARRIVED_STOP: { label: "Продолжить", action: "continue_boarding", enabled: true },
+  RACE_FINISHED: { label: "Завершить рейс", action: "end_shift", enabled: true },
 };
 
 // ============================================================================
@@ -287,12 +379,12 @@ export function getPanelVisibility(
       };
 
     case "RACE_BOARDING":
-  return {
-    mainButton: true,
-    queue: context.queueSize > 0 ? "active" : "hidden",
-    reservation: context.hasActiveReservations || context.currentStopIndex === 0 ? "waiting" : "hidden",
-    cash: "active",
-  };
+      return {
+        mainButton: true,
+        queue: context.queueSize > 0 ? "active" : "hidden",
+        reservation: context.hasActiveReservations || context.currentStopIndex === 0 ? "waiting" : "hidden",
+        cash: "active",
+      };
 
     case "RACE_IN_TRANSIT":
       return {
@@ -312,7 +404,7 @@ export function getPanelVisibility(
 
     case "RACE_FINISHED":
       return {
-        mainButton: true,
+        mainButton: false, // ← ИСПРАВЛЕНО
         queue: "hidden",
         reservation: "hidden",
         cash: "hidden",
@@ -329,7 +421,7 @@ export function getPanelVisibility(
 }
 
 // ============================================================================
-// LEGACY МАППИНГ (для совместимости со старым кодом)
+// LEGACY МАППИНГ
 // ============================================================================
 export const TRIP_STATUS_TO_RACE_STATE: Record<string, RaceState> = {
   PREP_IDLE: "RACE_OFFLINE",
@@ -341,7 +433,56 @@ export const TRIP_STATUS_TO_RACE_STATE: Record<string, RaceState> = {
 };
 
 // ============================================================================
-// ЛОГИРОВАНИЕ FSM СОБЫТИЙ
+// ВАЛИДАЦИЯ И УТИЛИТЫ
+// ============================================================================
+
+export function canTransition(
+  currentState: RaceState,
+  action: TransitionAction,
+  context: RaceContext
+): boolean {
+  const transition = FSM_TRANSITIONS.find(
+    (t) => t.from === currentState && t.action === action
+  );
+
+  if (!transition) {
+    return false;
+  }
+
+  if (transition.guard && !transition.guard(context)) {
+    return false;
+  }
+
+  return true;
+}
+
+export function getNextState(
+  currentState: RaceState,
+  action: TransitionAction,
+  context: RaceContext
+): RaceState | null {
+  if (!canTransition(currentState, action, context)) {
+    return null;
+  }
+
+  const transition = FSM_TRANSITIONS.find(
+    (t) => t.from === currentState && t.action === action
+  );
+
+  return transition?.to || null;
+}
+
+export function getAvailableActions(
+  currentState: RaceState,
+  context: RaceContext
+): TransitionAction[] {
+  return FSM_TRANSITIONS.filter(
+    (t) => t.from === currentState && (!t.guard || t.guard(context))
+  ).map((t) => t.action);
+}
+
+// ============================================================================
+// ЛОГИРОВАНИЕ
 // ============================================================================
 export interface FSMEvent {
   event: string;
@@ -373,7 +514,6 @@ export function logFSMEvent(
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ============================================================================
 
-// Создать контекст из текущего состояния приложения
 export function createRaceContext(params: {
   currentStopIndex: number;
   totalStops: number;
@@ -389,7 +529,6 @@ export function createRaceContext(params: {
   };
 }
 
-// Проверить, можно ли выполнить переход
 export function validateTransition(
   from: RaceState,
   action: TransitionAction,
