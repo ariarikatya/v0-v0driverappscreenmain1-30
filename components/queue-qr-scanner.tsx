@@ -24,6 +24,7 @@ export interface QueuePassenger {
     recipient: string
     created_at: string
   }
+  fsmState?: "waiting" | "selected" | "scanning" | "scan_success" | "scan_error" | "accepted" | "rejected"
 }
 
 interface QueueQRScannerProps {
@@ -56,8 +57,8 @@ export function QueueQRScanner({
   const handlePassengerClick = (passengerId: number) => {
     const passenger = passengers.find(p => p.id === passengerId)
     
-    // Если пассажир уже обработан (scanned или qrError), игнорируем клик
-    if (passenger && (passenger.scanned || passenger.qrError)) {
+    // Если пассажир уже принят (scanned = true и нет qrError), игнорируем клик
+    if (passenger && passenger.scanned && !passenger.qrError) {
       return
     }
     
@@ -79,7 +80,7 @@ export function QueueQRScanner({
     }
 
     // Используем выбранного пассажира или первого необработанного
-    const passengerId = selectedPassengerId || passengers.find(p => !p.scanned && !p.qrError)?.id
+    const passengerId = selectedPassengerId || passengers.find(p => !p.scanned || p.qrError)?.id
     
     if (!passengerId) {
       logFSMEvent("ui:blocked", { 
@@ -125,6 +126,7 @@ export function QueueQRScanner({
             scanned: true,
             qrError: false,
             qrData: mockQRData,
+            fsmState: "scan_success" as const,
           }
         : p
     )
@@ -152,14 +154,14 @@ export function QueueQRScanner({
             ...p,
             qrError: true,
             scanned: false,
+            fsmState: "scan_error" as const,
           }
         : p
     )
 
     onUpdate(updatedPassengers)
     
-    // Сбрасываем выбор после ошибки
-    setSelectedPassengerId(null)
+    // НЕ сбрасываем выбор - оставляем пассажира выбранным для повторного сканирования
     setShowScanner(false)
     setCurrentScanId(null)
     setScanLocked(false)
@@ -170,7 +172,7 @@ export function QueueQRScanner({
       passengerId,
       context: "queue"
     })
-    setSelectedPassengerId(null) // Сбрасываем выбор
+    setSelectedPassengerId(null)
     onAccept(passengerId)
   }
 
@@ -179,7 +181,7 @@ export function QueueQRScanner({
       passengerId,
       context: "queue"
     })
-    setSelectedPassengerId(null) // Сбрасываем выбор
+    setSelectedPassengerId(null)
     onReject(passengerId)
   }
 
@@ -188,7 +190,22 @@ export function QueueQRScanner({
       passengerId,
       context: "queue"
     })
-    setSelectedPassengerId(null) // Сбрасываем выбор
+    
+    // Обновляем состояние пассажира обратно в waiting
+    const updatedPassengers = passengers.map(p =>
+      p.id === passengerId
+        ? {
+            ...p,
+            scanned: false,
+            qrError: false,
+            qrData: undefined,
+            fsmState: "waiting" as const,
+          }
+        : p
+    )
+    
+    onUpdate(updatedPassengers)
+    setSelectedPassengerId(null)
     onReturn(passengerId)
   }
 
@@ -199,13 +216,22 @@ export function QueueQRScanner({
       .map((_, i) => <User key={i} className="h-4 w-4" />)
   }
 
+  // Фильтруем только необработанных пассажиров для отображения
+  const visiblePassengers = passengers.filter(p => !p.scanned || p.qrError)
+  
+  // Пересчитываем позиции в очереди
+  const passengersWithRenumbering = visiblePassengers.map((p, index) => ({
+    ...p,
+    queuePosition: index + 1
+  }))
+
   return (
     <>
       {/* Grid of passengers - теперь кликабельные */}
       <div className="grid grid-cols-5 gap-2 mb-4">
-        {passengers.slice(0, 5).map((passenger) => {
+        {passengersWithRenumbering.slice(0, 5).map((passenger) => {
           const isSelected = selectedPassengerId === passenger.id
-          const isProcessed = passenger.scanned || passenger.qrError
+          const isProcessed = passenger.scanned && !passenger.qrError
           
           return (
             <div
@@ -221,7 +247,22 @@ export function QueueQRScanner({
                       : "bg-secondary border-border"
               } ${!isProcessed ? "cursor-pointer hover:bg-accent/10" : "cursor-default"}`}
             >
-              {(passenger.qrError || (passenger.scanned && passenger.qrData)) && (
+              {passenger.qrError && (
+                <Button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    handleReturn(passenger.id)
+                  }}
+                  size="icon"
+                  variant="ghost"
+                  className="h-5 w-5 p-0 mb-1"
+                  title={t.revert}
+                  disabled={disabled}
+                >
+                  <X className="h-4 w-4 text-red-500" />
+                </Button>
+              )}
+              {(passenger.scanned && passenger.qrData && !passenger.qrError) && (
                 <Button
                   onClick={(e) => {
                     e.stopPropagation()
@@ -245,6 +286,11 @@ export function QueueQRScanner({
               {isSelected && !isProcessed && (
                 <span className="text-[10px] text-blue-600 dark:text-blue-400 font-semibold mt-0.5">
                   {language === "ru" ? "Выбран" : "Selected"}
+                </span>
+              )}
+              {passenger.qrError && (
+                <span className="text-[10px] text-red-600 dark:text-red-400 font-semibold mt-0.5">
+                  {language === "ru" ? "Ошибка" : "Error"}
                 </span>
               )}
             </div>
