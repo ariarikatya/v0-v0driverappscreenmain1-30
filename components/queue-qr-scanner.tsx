@@ -302,7 +302,7 @@ export function QueueQRScanner({
               )}
               {isPendingDecision && (
                 <span className="text-[10px] text-green-600 dark:text-green-400 font-semibold mt-0.5">
-                  {language === "ru" ? "Скан OK" : "Scan OK"}
+                  {language === "ru" ? "Удачно" : "Success"}
                 </span>
               )}
             </div>
