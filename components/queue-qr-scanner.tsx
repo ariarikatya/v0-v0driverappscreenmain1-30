@@ -53,16 +53,13 @@ export function QueueQRScanner({
   const [scanLocked, setScanLocked] = useState(false)
   const [selectedPassengerId, setSelectedPassengerId] = useState<number | null>(null)
 
-  // Обработка клика на карточку пассажира
   const handlePassengerClick = (passengerId: number) => {
     const passenger = passengers.find(p => p.id === passengerId)
     
-    // Если пассажир уже принят (scanned = true и нет qrError), игнорируем клик
     if (passenger && passenger.scanned && !passenger.qrError) {
       return
     }
     
-    // Выбираем/отменяем выбор
     if (selectedPassengerId === passengerId) {
       setSelectedPassengerId(null)
     } else {
@@ -79,7 +76,6 @@ export function QueueQRScanner({
       return
     }
 
-    // Используем выбранного пассажира или первого необработанного
     const passengerId = selectedPassengerId || passengers.find(p => !p.scanned || p.qrError)?.id
     
     if (!passengerId) {
@@ -133,7 +129,6 @@ export function QueueQRScanner({
 
     onUpdate(updatedPassengers)
     
-    // Сбрасываем выбор после успешного сканирования
     setSelectedPassengerId(null)
     setShowScanner(false)
     setCurrentScanId(null)
@@ -161,7 +156,7 @@ export function QueueQRScanner({
 
     onUpdate(updatedPassengers)
     
-    // НЕ сбрасываем выбор - оставляем пассажира выбранным для повторного сканирования
+    // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: НЕ сбрасываем selectedPassengerId
     setShowScanner(false)
     setCurrentScanId(null)
     setScanLocked(false)
@@ -191,7 +186,6 @@ export function QueueQRScanner({
       context: "queue"
     })
     
-    // Обновляем состояние пассажира обратно в waiting
     const updatedPassengers = passengers.map(p =>
       p.id === passengerId
         ? {
@@ -216,10 +210,8 @@ export function QueueQRScanner({
       .map((_, i) => <User key={i} className="h-4 w-4" />)
   }
 
-  // Фильтруем только необработанных пассажиров для отображения
+  // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: фильтрация и перенумерация
   const visiblePassengers = passengers.filter(p => !p.scanned || p.qrError)
-  
-  // Пересчитываем позиции в очереди
   const passengersWithRenumbering = visiblePassengers.map((p, index) => ({
     ...p,
     queuePosition: index + 1
@@ -227,7 +219,6 @@ export function QueueQRScanner({
 
   return (
     <>
-      {/* Grid of passengers - теперь кликабельные */}
       <div className="grid grid-cols-5 gap-2 mb-4">
         {passengersWithRenumbering.slice(0, 5).map((passenger) => {
           const isSelected = selectedPassengerId === passenger.id
@@ -298,7 +289,6 @@ export function QueueQRScanner({
         })}
       </div>
 
-      {/* Show accept/reject buttons for scanned passengers */}
       {passengers
         .filter(p => p.scanned && p.qrData && !p.qrError)
         .map(passenger => (
@@ -325,7 +315,6 @@ export function QueueQRScanner({
           </div>
         ))}
 
-      {/* Main scan button - только если нет pending accept/reject */}
       {!passengers.some(p => p.scanned && p.qrData && !p.qrError) && (
         <Button 
           onClick={handleStartScan} 
@@ -337,7 +326,6 @@ export function QueueQRScanner({
         </Button>
       )}
 
-      {/* Scanner dialog */}
       <CashQRDialog
         open={showScanner}
         onOpenChange={setShowScanner}
